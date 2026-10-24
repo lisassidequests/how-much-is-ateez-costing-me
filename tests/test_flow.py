@@ -196,7 +196,7 @@ def test_one_payment_covering_several_orders(env):
     assert "S$15.50" in pl.spent_text(store, cfg, None, "mingi")      # the share that went to the Mingi/Hongjoong order
     # undoing the payment reopens both orders
     assert "Removed the last payment" in pl.undo_last(store)
-    assert balances(store) == {1: 114.0, 2: 15.5}
+    assert balances(store) == {1: 0.0, 2: 0.0}                        # back to counted-as-paid from the orders
 
 
 def test_payment_picks_unique_combination_among_many_orders(env):
@@ -591,3 +591,29 @@ def test_all_overview_and_settle(env):
     assert "Nothing owing" in pl.owing_text(store, cfg, "MISMATCH")
     assert "Reopened order" in pl.undo_last(store)
     assert len(pl.settle_drafts(store, oid)) == 1
+
+
+def test_order_counts_as_paid_and_screenshot_replaces_it(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    order = {"kind": "order_confirmation", "summary": "o", "title": "SOME PO", "total_due": 54.5,
+             "items": [{"name": "SAN", "qty": 1, "line_total": 54.5}]}
+    out = ingest(store, FakeParser(order), cfg, text="order", when=now)
+    assert "Counted as paid in full" in pl.render_draft(out["draft"], "S$", TZ)
+    assert "Counted as paid in full" in confirm(store, out, cfg)
+    assert "Nothing owing" in pl.owing_text(store, cfg)
+    assert "S$54.50 across 1 payment(s)" in pl.spent_text(store, cfg, None, None)
+
+    # a screenshot with the exact amount auto-matches the assumed order
+    assert ingest(store, FakeParser(pay_msg(54.5)), cfg, photo="S2")["draft"]["selected"] == [1]
+    # a different amount: tick the order, the real payment replaces the assumption (spend not doubled, gap shows)
+    out3 = ingest(store, FakeParser(pay_msg(43.5)), cfg, photo="S3")
+    assert out3["draft"]["selected"] == [] and out3["draft"]["candidates"][0]["owes"] == 54.5
+    pl.toggle_payment_order(store, out3["draft_id"], 1)
+    pl.apply_draft(store, out3["draft_id"], "S$", TZ)
+    assert "S$43.50 across 1 payment(s)" in pl.spent_text(store, cfg, None, None)
+    assert "owing S$11.00" in pl.owing_text(store, cfg)
+    assert "Removed the last payment" in pl.undo_last(store)           # the assumed S$54.50 comes back
+    assert "Nothing owing" in pl.owing_text(store, cfg)
+    assert "Removed order 1" in pl.undo_last(store)
+    assert store.one("SELECT COUNT(*) c FROM payments")["c"] == 0

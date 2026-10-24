@@ -86,7 +86,7 @@ def find_duplicate_order(store: Store, title: str, total: float, items: list[dic
 
 def find_duplicate_payment(store: Store, amount: float, paid_at: str, tz: ZoneInfo):
     day = to_dt(paid_at, tz).astimezone(tz).date()
-    for p in store.all("SELECT * FROM payments"):
+    for p in store.all("SELECT * FROM payments WHERE assumed=0"):
         if abs(p["amount"] - amount) <= TOL and to_dt(p["paid_at"], tz).astimezone(tz).date() == day:
             return p
     return None
@@ -128,7 +128,7 @@ def plan_allocation(store: Store, amount: float, order_ids: list[int]):
     for oid in sorted(order_ids):
         if oid not in bal:
             continue
-        owes = round(bal[oid]["total_due"] - bal[oid]["paid"], 2)
+        owes = round(bal[oid]["total_due"] - bal[oid]["real_paid"], 2)   # automatic "assumed" payments don't count
         take = round(min(owes, remaining), 2)
         if owes <= TOL or take <= TOL:
             continue
@@ -219,8 +219,8 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
         if amount is None:
             return {"kind": "unreadable", "reason": "I couldn't read the payment amount from this screenshot."}
         amount = float(amount)
-        outstanding = [o for o in store.orders_with_balance() if o["total_due"] - o["paid"] > TOL]
-        cands = [{"id": o["id"], "owes": round(o["total_due"] - o["paid"], 2),
+        outstanding = [o for o in store.orders_with_balance() if o["total_due"] - o["real_paid"] > TOL]
+        cands = [{"id": o["id"], "owes": round(o["total_due"] - o["real_paid"], 2),
                   "label": f"Order {o['id']}: {o['title'][:32]}"} for o in outstanding[:MAX_PAY_CANDIDATES]]
         # one transfer may cover several orders: look for the unique combination of unpaid orders that adds up
         matches = [[c["id"] for c in combo]
@@ -343,8 +343,10 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
                 else "🔗 Not linked to a channel post (tap Change link to pick one)")
         fee = f"\nMailing fee: {money(d['mailing_fee'], cur)}" if d.get("mailing_fee") else ""
         note = f"\nNote: {d['note']}" if d.get("note") else ""
+        paid = (f"\n💸 Counted as paid in full ({money(d['total_due'], cur)}). No screenshot needed unless "
+                "what you actually paid differs." if d.get("total_due", 0) > 0 else "")
         return (f"🛒 Order: {d['title']}\n{lines}{fee}\nTotal: {money(d['total_due'], cur)}{note}\n"
-                f"{link}\nOrdered: {fmt_date(d['ordered_at'], tz)}{warn}")
+                f"{link}\nOrdered: {fmt_date(d['ordered_at'], tz)}{paid}{warn}")
     if k == "payment":
         ref = f"\nRef: {d['reference']}" if d.get("reference") else ""
         plan = d.get("plan", [])
@@ -422,14 +424,22 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
         oid, item_ids = store.add_order(d.get("post_id"), d["title"], d["total_due"], d.get("mailing_fee"),
                                         d.get("note"), d["ordered_at"], d.get("raw_text"), d["items"])
         result = {"type": "order", "order_id": oid, "item_ids": item_ids}
-        text = (f"✅ Order {oid} saved: {len(item_ids)} item(s), {money(d['total_due'], cur)}.\n"
-                "Send your payment screenshot when you've paid.")
+        text = f"✅ Order {oid} saved: {len(item_ids)} item(s), {money(d['total_due'], cur)}."
+        if d["total_due"] > 0:  # you pay instantly, so a payment request counts as paid
+            pid = store.add_payment(d["total_due"], d["ordered_at"], "assumed from order", assumed=True)
+            store.add_allocation(pid, oid, d["total_due"])
+            result["payment_id"] = pid
+            text += "\n💸 Counted as paid in full. If you paid a different amount, send the payment screenshot and I'll correct it."
     elif k == "payment":
         plan, remainder = plan_allocation(store, d["amount"], d["selected"])
+        replaced = [{"amount": r["amount"], "paid_at": r["paid_at"], "reference": r["reference"], "order_id": r["order_id"]}
+                    for r in store.assumed_payments_for([oid for oid, _a, _o in plan])]
+        for r in store.assumed_payments_for([oid for oid, _a, _o in plan]):   # the real payment replaces the assumed one
+            store.run("DELETE FROM payments WHERE id=?", (r["id"],))
         pid = store.add_payment(d["amount"], d["paid_at"], d.get("reference"))
         for oid, amt, _owes in plan:
             store.add_allocation(pid, oid, amt)
-        result = {"type": "payment", "payment_id": pid}
+        result = {"type": "payment", "payment_id": pid, "replaced": replaced}
         text = f"✅ Logged {money(d['amount'], cur)}."
         if plan:
             bal = {o["id"]: o for o in store.orders_with_balance()}
@@ -485,10 +495,16 @@ def undo_last(store: Store) -> str:
         store.run("DELETE FROM posts WHERE id=?", (r["post_id"],))
         msg = "Removed the last saved post."
     elif r["type"] == "order":
+        if r.get("payment_id"):
+            store.run("DELETE FROM payments WHERE id=?", (r["payment_id"],))
         store.run("DELETE FROM orders WHERE id=?", (r["order_id"],))
-        msg = f"Removed order {r['order_id']} and its items (any payments linked to it are kept, unlinked)."
+        msg = f"Removed order {r['order_id']} and its items (real payments linked to it are kept, unlinked)."
     elif r["type"] == "payment":
         store.run("DELETE FROM payments WHERE id=?", (r["payment_id"],))
+        for a in r.get("replaced", []):  # bring back the assumed payments this one had replaced
+            if store.one("SELECT 1 FROM orders WHERE id=?", (a["order_id"],)):
+                pid = store.add_payment(a["amount"], a["paid_at"], a["reference"], assumed=True)
+                store.add_allocation(pid, a["order_id"], a["amount"])
         msg = "Removed the last payment."
     elif r["type"] == "settle":
         store.run("UPDATE orders SET total_due=?, settled_from=NULL WHERE id=?", (r["old_total"], r["order_id"]))

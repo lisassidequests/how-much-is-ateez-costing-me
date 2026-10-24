@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS payments (
   amount REAL NOT NULL,
   paid_at TEXT NOT NULL,
   reference TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  assumed INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS allocations (
   id INTEGER PRIMARY KEY,
@@ -104,6 +105,8 @@ class Store:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
         if "settled_from" not in {r["name"] for r in self.all("PRAGMA table_info(orders)")}:
             self.db.execute("ALTER TABLE orders ADD COLUMN settled_from REAL")
+        if "assumed" not in {r["name"] for r in self.all("PRAGMA table_info(payments)")}:
+            self.db.execute("ALTER TABLE payments ADD COLUMN assumed INTEGER NOT NULL DEFAULT 0")
         # payments used to link to a single order (payments.order_id); they now split across orders via allocations
         self.db.execute("INSERT INTO allocations(payment_id,order_id,amount) SELECT id, order_id, amount FROM payments "
                         "WHERE order_id IS NOT NULL AND id NOT IN (SELECT payment_id FROM allocations)")
@@ -256,11 +259,20 @@ class Store:
             ))
         return oid, item_ids
 
-    def add_payment(self, amount, paid_at, reference) -> int:
+    def add_payment(self, amount, paid_at, reference, assumed: bool = False) -> int:
+        """assumed=True: recorded automatically when an order was saved (you pay instantly); a real screenshot replaces it."""
         return self.run(
-            "INSERT INTO payments(amount,paid_at,reference,created_at) VALUES(?,?,?,?)",
-            (amount, paid_at, reference, now_iso()),
+            "INSERT INTO payments(amount,paid_at,reference,created_at,assumed) VALUES(?,?,?,?,?)",
+            (amount, paid_at, reference, now_iso(), 1 if assumed else 0),
         )
+
+    def assumed_payments_for(self, order_ids):
+        if not order_ids:
+            return []
+        return self.all(
+            "SELECT pay.id, pay.amount, pay.paid_at, pay.reference, a.order_id FROM payments pay "
+            "JOIN allocations a ON a.payment_id=pay.id "
+            f"WHERE pay.assumed=1 AND a.order_id IN ({','.join('?' * len(order_ids))})", list(order_ids))
 
     def add_allocation(self, payment_id: int, order_id: int, amount: float) -> int:
         """Say how much of a payment went towards an order. One payment can have several."""
@@ -271,6 +283,8 @@ class Store:
         """Every order with how much has been paid so far."""
         return self.all(
             "SELECT o.*, COALESCE((SELECT SUM(amount) FROM allocations WHERE order_id=o.id),0) AS paid, "
+            "COALESCE((SELECT SUM(a.amount) FROM allocations a JOIN payments pay ON pay.id=a.payment_id "
+            "WHERE a.order_id=o.id AND pay.assumed=0),0) AS real_paid, "
             "(SELECT MIN(pay.paid_at) FROM payments pay JOIN allocations a ON a.payment_id=pay.id WHERE a.order_id=o.id) AS first_paid "
             "FROM orders o ORDER BY o.id DESC"
         )
