@@ -16,6 +16,7 @@ Single user. Python 3.10+, SQLite, python-telegram-bot (long polling), Anthropic
 - Amounts are SGD. User pays instantly; late fees are ignored.
 - Item is "late" 28 days (LATE_DAYS) after first payment, or after order date if unpaid.
 - Proactive reminder is a single text-only weekly digest (Sunday 10:00 SGT) of everything still incoming, late batches flagged. No daily alerts, no photos (photos only via /pending_photos; /pending is the same text list on demand). `items.last_alert_at` is now unused.
+- "OT8" = one piece of each of the 8 members (8 pieces total); "OT4" = 4 pieces. Item qty is in pieces, and the seller's "X1" count prefix is stripped from item names.
 - Payments are separate rows (partial/second payments exist). Spend = sum of payments.
 - If Claude is unavailable (no credits, bad key, outage) messages stay `queued` in `inbox` and are retried automatically; the user is told once per 6 hours.
 - Only `ALLOWED_USER_ID` may use the bot.

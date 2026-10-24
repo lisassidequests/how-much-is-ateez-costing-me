@@ -30,6 +30,8 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
      "X1 OT8 INDIVIDUAL" with "$8.50/individual pc" means qty 8, line_total 68.00;
      "X1 OT4 UNIT" with "$11.50/unit pc" means qty 4, line_total 46.00.
      Always make the item line_totals reconcile with the stated total where possible.
+     Group sizes: "OT8" = one piece of each of the 8 members (8 pieces); "OT4" = 4 pieces.
+     A set like "X1 OT8" is qty 8; keep the item name as "OT8" (no "X1").
    - total_due = the "Total to transfer" amount. mailing_fee only if stated separately.
    - note = short remark such as "first payment, pending second payment" when present.
    - matched_tag: compare title against the KNOWN POSTS list given by the user and return the tag
