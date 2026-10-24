@@ -314,14 +314,35 @@ def late_rows(store: Store, cfg: Config, now: datetime, keyword: str | None = No
             and keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
 
 
-def due_late_alerts(store: Store, cfg: Config, now: datetime, repeat_days: int = 7) -> list[dict]:
-    """Late items not alerted in the last `repeat_days` days, grouped for sending."""
-    rows = []
-    for r in late_rows(store, cfg, now):
-        last = r["last_alert_at"]
-        if last is None or (now - to_dt(last, cfg.tz)) >= timedelta(days=repeat_days):
-            rows.append(r)
-    return pending_messages(store, cfg, now, rows)
+def weekly_digest(store: Store, cfg: Config, now: datetime) -> list[str]:
+    """Text-only roundup of everything still incoming, oldest first, late batches flagged.
+    Returns [] when nothing is pending. Split into chunks to stay under Telegram's message limit."""
+    batches: dict[str, dict] = {}
+    for r in store.items_pending():
+        key = r["tag"] or f"order-{r['order_id']}"
+        b = batches.setdefault(key, {
+            "head": (f"#{r['tag']} {r['post_title']}" if r["tag"] else f"{r['order_title']} (no post linked)"),
+            "names": [], "age": 0})
+        b["names"].append(r["name"] if r["qty"] == 1 else f"{r['name']} ×{r['qty']}")
+        b["age"] = max(b["age"], (now - clock_start(r, cfg.tz)).days)
+    if not batches:
+        return []
+    ordered = sorted(batches.values(), key=lambda b: -b["age"])
+    n_items = len(store.items_pending())
+    n_late = sum(1 for b in ordered if b["age"] >= cfg.late_days)
+    header = f"📦 Still incoming: {n_items} item(s) in {len(ordered)} batch(es)"
+    if n_late:
+        header += f"\n⚠️ {n_late} batch(es) past {cfg.late_days // 7} weeks. Maybe ask the seller?"
+    lines = [f"{'⚠️ ' if b['age'] >= cfg.late_days else '• '}{b['head']}: {', '.join(b['names'])} ({b['age']}d)"
+             for b in ordered]
+    chunks, cur = [], header
+    for line in lines:
+        if len(cur) + len(line) + 2 > 3800:
+            chunks.append(cur)
+            cur = "(continued)"
+        cur += "\n" + line
+    chunks.append(cur)
+    return chunks
 
 
 def spent_text(store: Store, cfg: Config, month: str | None, keyword: str | None) -> str:

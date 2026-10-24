@@ -251,7 +251,3 @@ class Store:
     def mark_arrived(self, item_ids, when: str) -> None:
         for iid in item_ids:
             self.run("UPDATE items SET arrived_at=? WHERE id=? AND arrived_at IS NULL", (when, iid))
-
-    def mark_alerted(self, item_ids, when: str) -> None:
-        for iid in item_ids:
-            self.run("UPDATE items SET last_alert_at=? WHERE id=?", (when, iid))

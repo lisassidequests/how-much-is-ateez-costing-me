@@ -14,7 +14,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 from . import pipeline as pl
 from .ai import Parser
 from .config import Config
-from .store import Store, now_iso
+from .store import Store
 
 log = logging.getLogger("ateez_bot")
 
@@ -227,21 +227,13 @@ class BotApp:
             announced = True
             await self.deliver(row["chat_id"], out)
 
-    async def job_daily_check(self, ctx: ContextTypes.DEFAULT_TYPE):
+    async def job_weekly_digest(self, ctx: ContextTypes.DEFAULT_TYPE):
+        """Text-only roundup of everything still incoming. Photos stay on demand via /pending."""
         uid = self.cfg.allowed_user_id
         if not uid:
             return
-        msgs = pl.due_late_alerts(self.store, self.cfg, datetime.now(self.cfg.tz))
-        if not msgs:
-            return
-        total = sum(len(m["item_ids"]) for m in msgs)
-        weeks = max(self.cfg.late_days // 7, 1)
-        await self.send(uid, f"⏰ {total} item(s) still haven't arrived after {weeks}+ weeks. "
-                             "Time to ask the seller?")
-        sent = pl.cap_messages(msgs)
-        await self.send_messages(uid, sent)
-        for m in sent:
-            self.store.mark_alerted(m.get("item_ids", []), now_iso())
+        for chunk in pl.weekly_digest(self.store, self.cfg, datetime.now(self.cfg.tz)):
+            await self.send(uid, chunk)
 
     async def job_health_ping(self, ctx: ContextTypes.DEFAULT_TYPE):
         url = self.cfg.healthcheck_url
@@ -268,7 +260,8 @@ class BotApp:
             (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.IMAGE, self.on_message))
         app.add_error_handler(self.on_error)
         jq = app.job_queue
-        jq.run_daily(self.job_daily_check, time=time(self.cfg.daily_check_hour, 0, tzinfo=self.cfg.tz))
+        jq.run_daily(self.job_weekly_digest, days=(self.cfg.digest_day,),
+                     time=time(self.cfg.digest_hour, 0, tzinfo=self.cfg.tz))
         jq.run_repeating(self.job_retry_queue, interval=900, first=60)
         if self.cfg.healthcheck_url:
             jq.run_repeating(self.job_health_ping, interval=300, first=10)

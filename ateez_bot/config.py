@@ -18,8 +18,12 @@ class Config:
     tz: ZoneInfo
     currency: str
     late_days: int
-    daily_check_hour: int
+    digest_day: int  # python-telegram-bot convention: 0=Sunday ... 6=Saturday
+    digest_hour: int
     healthcheck_url: str | None
+
+
+DAYS = {"sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4, "friday": 5, "saturday": 6}
 
 
 def load_config() -> Config:
@@ -40,6 +44,7 @@ def load_config() -> Config:
         tz=ZoneInfo(os.environ.get("TIMEZONE", "Asia/Singapore")),
         currency=os.environ.get("CURRENCY", "S$"),
         late_days=int(os.environ.get("LATE_DAYS", "28")),
-        daily_check_hour=int(os.environ.get("DAILY_CHECK_HOUR", "10")),
+        digest_day=DAYS[os.environ.get("DIGEST_DAY", "sunday").strip().lower()],
+        digest_hour=int(os.environ.get("DIGEST_HOUR", "10")),
         healthcheck_url=os.environ.get("HEALTHCHECK_URL", "").strip() or None,
     )

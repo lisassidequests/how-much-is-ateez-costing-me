@@ -15,7 +15,7 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 `/pending [name]` (with photos) · `/late` · `/spent [YYYY-MM or name]` · `/owing` · `/undo` · `/status`
 Or ask in plain words: "how much have I spent on ateez this month?"
 
-A daily 10:00 SGT check messages you about items not arrived 4 weeks after payment (repeats weekly until resolved).
+Every Sunday at 10:00 SGT it sends one text message listing everything still incoming, oldest first, with batches past 4 weeks flagged ⚠️. No photos, so it stays short; use `/pending` when you want the pictures. Change the day/time with `DIGEST_DAY` / `DIGEST_HOUR` in `.env`.
 
 ## If something breaks
 - **Out of Anthropic credits / bad key / outage:** the bot tells you in Telegram, keeps your forwarded messages, and processes them automatically when it recovers.

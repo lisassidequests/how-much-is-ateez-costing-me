@@ -14,7 +14,8 @@ Single user. Python 3.10+, SQLite, python-telegram-bot (long polling), Anthropic
 - Seller's channel posts carry a serial hashtag (e.g. `#anghp6_4`); her order-confirmation DMs have NO serial and are matched to posts by product title; arrival updates cite serials.
 - Nothing is saved until the user taps Confirm. Claude only extracts; sums and totals are computed in code.
 - Amounts are SGD. User pays instantly; late fees are ignored.
-- Item is "late" 28 days (LATE_DAYS) after first payment, or after order date if unpaid. Re-alert at most every 7 days.
+- Item is "late" 28 days (LATE_DAYS) after first payment, or after order date if unpaid.
+- Proactive reminder is a single text-only weekly digest (Sunday 10:00 SGT) of everything still incoming, late batches flagged. No daily alerts, no photos (photos only via /pending). `items.last_alert_at` is now unused.
 - Payments are separate rows (partial/second payments exist). Spend = sum of payments.
 - If Claude is unavailable (no credits, bad key, outage) messages stay `queued` in `inbox` and are retried automatically; the user is told once per 6 hours.
 - Only `ALLOWED_USER_ID` may use the bot.

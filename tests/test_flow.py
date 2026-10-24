@@ -21,7 +21,7 @@ TZ = ZoneInfo("Asia/Singapore")
 
 def make_cfg(**kw):
     base = dict(telegram_token="123:abc", anthropic_api_key="x", allowed_user_id=1, model="m",
-                db_path=":memory:", tz=TZ, currency="S$", late_days=28, daily_check_hour=10,
+                db_path=":memory:", tz=TZ, currency="S$", late_days=28, digest_day=0, digest_hour=10,
                 healthcheck_url=None)
     base.update(kw)
     return Config(**base)
@@ -144,7 +144,7 @@ def test_total_mismatch_is_flagged(env):
     assert out["draft"]["warnings"] and "add up" in out["draft"]["warnings"][0]
 
 
-def test_late_flag_uses_payment_date_and_dedupes_alerts(env):
+def test_late_flag_uses_payment_date_and_weekly_digest(env):
     cfg, store = env
     old = datetime.now(TZ) - timedelta(days=30)
     setup_orders(store, cfg, old)
@@ -157,11 +157,18 @@ def test_late_flag_uses_payment_date_and_dedupes_alerts(env):
     confirm(store, ingest(store, FakeParser(pay), cfg, photo="S"), cfg)
     assert {r["name"] for r in pl.late_rows(store, cfg, now)} == {"MINGI", "HONGJOONG"}
 
-    alerts = pl.due_late_alerts(store, cfg, now)
-    assert len(alerts) == 1
-    store.mark_alerted(alerts[0]["item_ids"], now.isoformat())
-    assert pl.due_late_alerts(store, cfg, now) == []                           # no repeat spam
-    assert len(pl.due_late_alerts(store, cfg, now + timedelta(days=8))) == 1   # nags again after a week
+    # weekly digest: one text-only message listing everything incoming, late batch flagged and listed first
+    chunks = pl.weekly_digest(store, cfg, now)
+    assert len(chunks) == 1
+    text = chunks[0]
+    assert "4 item(s) in 2 batch(es)" in text and "1 batch(es) past 4 weeks" in text
+    lines = text.split("\n")
+    assert lines[-2].startswith("⚠️") and "MINGI" in lines[-2]   # oldest (late, unpaid) first
+    assert lines[-1].startswith("• #anghp5_2")                    # recently paid batch not flagged
+
+    # nothing incoming -> no digest at all
+    store.mark_arrived([r["id"] for r in store.items_pending()], now.isoformat())
+    assert pl.weekly_digest(store, cfg, now) == []
 
 
 def test_ambiguous_payment_asks_instead_of_guessing(env):
