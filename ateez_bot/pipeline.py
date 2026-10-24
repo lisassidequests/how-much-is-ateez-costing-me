@@ -314,11 +314,14 @@ def late_rows(store: Store, cfg: Config, now: datetime, keyword: str | None = No
             and keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
 
 
-def weekly_digest(store: Store, cfg: Config, now: datetime) -> list[str]:
+def weekly_digest(store: Store, cfg: Config, now: datetime, keyword: str | None = None) -> list[str]:
     """Text-only roundup of everything still incoming, oldest first, late batches flagged.
-    Returns [] when nothing is pending. Split into chunks to stay under Telegram's message limit."""
+    Used for the Sunday digest and /pending. Returns [] when nothing is pending.
+    Split into chunks to stay under Telegram's message limit."""
     batches: dict[str, dict] = {}
-    for r in store.items_pending():
+    pending = [r for r in store.items_pending()
+               if keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
+    for r in pending:
         key = r["tag"] or f"order-{r['order_id']}"
         b = batches.setdefault(key, {
             "head": (f"#{r['tag']} {r['post_title']}" if r["tag"] else f"{r['order_title']} (no post linked)"),
@@ -328,7 +331,7 @@ def weekly_digest(store: Store, cfg: Config, now: datetime) -> list[str]:
     if not batches:
         return []
     ordered = sorted(batches.values(), key=lambda b: -b["age"])
-    n_items = len(store.items_pending())
+    n_items = len(pending)
     n_late = sum(1 for b in ordered if b["age"] >= cfg.late_days)
     header = f"📦 Still incoming: {n_items} item(s) in {len(ordered)} batch(es)"
     if n_late:
@@ -389,7 +392,10 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return [{"text": spent_text(store, cfg, month, kw)}]
     if intent == "owing":
         return [{"text": owing_text(store, cfg, kw)}]
-    if intent in ("pending", "late"):
+    if intent == "pending":  # compact text list of everything not arrived, late or not
+        chunks = weekly_digest(store, cfg, now, kw)
+        return [{"text": c} for c in chunks] or [{"text": "🎉 Nothing pending."}]
+    if intent in ("pending_photos", "late"):
         rows = (late_rows(store, cfg, now, kw) if intent == "late" else
                 [r for r in store.items_pending()
                  if keyword_ok(kw, r["name"], r["order_title"], r["post_title"], r["tag"])])
@@ -403,7 +409,7 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
 def cap_messages(msgs: list[dict]) -> list[dict]:
     if len(msgs) <= MAX_GROUPS:
         return msgs
-    return msgs[:MAX_GROUPS] + [{"text": f"…and {len(msgs) - MAX_GROUPS} more batches. Narrow it down, e.g. /pending ateez."}]
+    return msgs[:MAX_GROUPS] + [{"text": f"…and {len(msgs) - MAX_GROUPS} more batches. Narrow it down, e.g. /pending_photos ateez."}]
 
 
 def status_text(store: Store, cfg: Config) -> str:

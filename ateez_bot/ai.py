@@ -44,7 +44,8 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
    mentioned, may be empty) and note.
 
 5. question - the buyer asking about their own records (typed, not forwarded). Return question
-   with intent one of: spent, pending, late, owing; optional month (YYYY-MM) and keyword
+   with intent one of: spent, pending (text list), pending_photos (when they ask to see pictures
+   of what's pending), late, owing; optional month (YYYY-MM) and keyword
    (e.g. a group, member or product name).
 
 6. other - anything else.
@@ -81,7 +82,8 @@ TOOL = {
             "reference": {"type": ["string", "null"]},
             "tags": {"type": "array", "items": {"type": "string"}},
             "names": {"type": "array", "items": {"type": "string"}},
-            "intent": {"type": ["string", "null"], "enum": ["spent", "pending", "late", "owing", None]},
+            "intent": {"type": ["string", "null"],
+                       "enum": ["spent", "pending", "pending_photos", "late", "owing", None]},
             "month": {"type": ["string", "null"]},
             "keyword": {"type": ["string", "null"]},
         },

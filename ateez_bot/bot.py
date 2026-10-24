@@ -25,7 +25,8 @@ HELP = (
     "• your payment screenshots\n"
     "• her arrival updates\n"
     "I'll show what I understood and wait for your ✅ before saving anything.\n\n"
-    "/pending [name]: what hasn't arrived (with photos)\n"
+    "/pending [name]: text list of everything not arrived yet, late or not\n"
+    "/pending_photos [name]: same, with the photos\n"
     "/late: items past the late threshold\n"
     "/spent [YYYY-MM or name]: how much you've spent\n"
     "/owing: unpaid or part-paid orders\n"
@@ -130,6 +131,10 @@ class BotApp:
         if self.authorized(update):
             await self._reply_report(update, {"intent": "pending", "keyword": " ".join(ctx.args) or None})
 
+    async def cmd_pending_photos(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "pending_photos", "keyword": " ".join(ctx.args) or None})
+
     async def cmd_late(self, update: Update, ctx):
         if self.authorized(update):
             await self._reply_report(update, {"intent": "late", "keyword": " ".join(ctx.args) or None})
@@ -228,7 +233,7 @@ class BotApp:
             await self.deliver(row["chat_id"], out)
 
     async def job_weekly_digest(self, ctx: ContextTypes.DEFAULT_TYPE):
-        """Text-only roundup of everything still incoming. Photos stay on demand via /pending."""
+        """Text-only roundup of everything still incoming. Photos stay on demand via /pending_photos."""
         uid = self.cfg.allowed_user_id
         if not uid:
             return
@@ -249,9 +254,23 @@ class BotApp:
 
     # ------------------------------------------------------------ wiring
     def build(self) -> Application:
-        app = Application.builder().token(self.cfg.telegram_token).build()
+        async def post_init(application: Application) -> None:
+            # Fills Telegram's "/" command menu so you don't have to remember the names.
+            await application.bot.set_my_commands([
+                ("pending", "What hasn't arrived yet (text list)"),
+                ("pending_photos", "What hasn't arrived yet, with photos"),
+                ("late", "Items past the late threshold"),
+                ("spent", "How much I've spent"),
+                ("owing", "Unpaid or part-paid orders"),
+                ("undo", "Reverse the last confirmed item"),
+                ("status", "Bot health check"),
+                ("help", "How to use this bot"),
+            ])
+
+        app = Application.builder().token(self.cfg.telegram_token).post_init(post_init).build()
         self.app = app
         for name, fn in [("start", self.cmd_start), ("help", self.cmd_help), ("pending", self.cmd_pending),
+                         ("pending_photos", self.cmd_pending_photos),
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("status", self.cmd_status)]:
             app.add_handler(CommandHandler(name, fn))

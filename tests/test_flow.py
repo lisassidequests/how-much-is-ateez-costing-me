@@ -216,6 +216,19 @@ def test_question_routing(env):
     assert out["type"] == "answers" and "MINGI" in out["messages"][0]["text"]
 
 
+def test_pending_text_vs_photos(env):
+    cfg, store = env
+    setup_orders(store, cfg, datetime.now(TZ))      # nothing late yet: both views still list everything
+    now = datetime.now(TZ)
+    text = pl.answer_question(store, cfg, {"intent": "pending"}, now)
+    assert len(text) == 1 and text[0].get("photo") is None
+    assert "4 item(s)" in text[0]["text"] and "MINGI" in text[0]["text"] and "OT8" in text[0]["text"]
+    photos = pl.answer_question(store, cfg, {"intent": "pending_photos"}, now)
+    assert any(m.get("photo") == "PHOTO1" for m in photos)   # the post's picture comes with its batch
+    only = pl.answer_question(store, cfg, {"intent": "pending", "keyword": "mingi"}, now)
+    assert "MINGI" in only[0]["text"] and "OT8" not in only[0]["text"]
+
+
 def test_classify_error_detects_credit_problem():
     req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     resp = httpx.Response(400, request=req)
