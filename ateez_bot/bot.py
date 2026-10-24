@@ -1,0 +1,275 @@
+"""Telegram layer: thin handlers around pipeline.py, plus scheduled jobs."""
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, time, timedelta
+
+import httpx
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
+
+from . import pipeline as pl
+from .ai import Parser
+from .config import Config
+from .store import Store, now_iso
+
+log = logging.getLogger("ateez_bot")
+
+HELP = (
+    "Forward me:\n"
+    "• her channel posts (with the photo) so I know what each #serial is\n"
+    "• her order confirmation DMs\n"
+    "• your payment screenshots\n"
+    "• her arrival updates\n"
+    "I'll show what I understood and wait for your ✅ before saving anything.\n\n"
+    "/pending [name]: what hasn't arrived (with photos)\n"
+    "/late: items past the late threshold\n"
+    "/spent [YYYY-MM or name]: how much you've spent\n"
+    "/owing: unpaid or part-paid orders\n"
+    "/undo: reverse the last thing you confirmed\n"
+    "/status: health check\n"
+    "You can also just ask, e.g. \"how much have I spent on ateez this month?\""
+)
+
+AI_DOWN_TEXT = {
+    "credits": "⚠️ Your Anthropic API credits have run out. Top up in the Anthropic Console (Billing). "
+               "Your messages are saved and I'll process them automatically once credits are back.",
+    "auth": "⚠️ The Anthropic API key was rejected. Update ANTHROPIC_API_KEY in the server's .env and run "
+            "`sudo systemctl restart ateez-bot`. Your messages are saved in the meantime.",
+    "temporary": "⚠️ Claude is temporarily unavailable. Your messages are saved and I'll retry every 15 minutes.",
+}
+
+
+def markup(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
+
+
+class BotApp:
+    def __init__(self, cfg: Config, store: Store, parser: Parser):
+        self.cfg, self.store, self.parser = cfg, store, parser
+        self.app: Application | None = None
+
+    # ------------------------------------------------------------ plumbing
+    def authorized(self, update: Update) -> bool:
+        u = update.effective_user
+        return bool(u) and self.cfg.allowed_user_id is not None and u.id == self.cfg.allowed_user_id
+
+    async def _download(self, file_id: str) -> bytes:
+        f = await self.app.bot.get_file(file_id)
+        return bytes(await f.download_as_bytearray())
+
+    async def send(self, chat_id: int, text: str, **kw):
+        return await self.app.bot.send_message(chat_id=chat_id, text=text, **kw)
+
+    async def send_messages(self, chat_id: int, msgs: list[dict]) -> None:
+        for m in msgs:
+            if m.get("photo"):
+                try:
+                    await self.app.bot.send_photo(chat_id=chat_id, photo=m["photo"], caption=m["text"])
+                    continue
+                except BadRequest:
+                    log.warning("Photo send failed, falling back to text")
+            await self.send(chat_id, m["text"])
+
+    def _rate_limited_alert_due(self, key: str, hours: float) -> bool:
+        last = self.store.get_setting(key)
+        if last and datetime.fromisoformat(last) > datetime.now().astimezone() - timedelta(hours=hours):
+            return False
+        self.store.set_setting(key, datetime.now().astimezone().isoformat())
+        return True
+
+    # ------------------------------------------------------------ delivering results
+    async def deliver(self, chat_id: int, out: dict) -> None:
+        t = out["type"]
+        if t == "draft":
+            d = out["draft"]
+            await self.send(chat_id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                            reply_markup=markup(pl.draft_buttons(out["draft_id"], d)))
+        elif t == "answers":
+            await self.send_messages(chat_id, out["messages"])
+        elif t == "info":
+            await self.send(chat_id, out["text"])
+        elif t == "ai_down":
+            self.store.set_setting("ai_down", "1")
+            if self._rate_limited_alert_due(f"ai_alert_{out['kind']}", 6):
+                await self.send(chat_id, AI_DOWN_TEXT[out["kind"]])
+            else:
+                await self.send(chat_id, "📥 Saved. I'll process it as soon as Claude is available.")
+        elif t == "failed":
+            await self.send(chat_id, f"⚠️ I couldn't process that message ({out['error']}). It's saved; "
+                                     "try forwarding it again or tell Claude Code to look at the logs.")
+
+    async def process(self, inbox_id: int) -> None:
+        row = self.store.inbox_get(inbox_id)
+        out = await pl.run_inbox_item(self.store, self.parser, self.cfg, row, self._download)
+        await self.deliver(row["chat_id"], out)
+
+    # ------------------------------------------------------------ handlers
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if self.cfg.allowed_user_id is None:
+            await update.effective_message.reply_text(
+                f"Your Telegram user ID is {uid}.\nSet ALLOWED_USER_ID={uid} in .env and restart the bot. "
+                "Until then I ignore everything else so strangers can't use your API credits.")
+            return
+        if self.authorized(update):
+            await update.effective_message.reply_text("Hi! " + HELP)
+
+    async def cmd_help(self, update: Update, ctx):
+        if self.authorized(update):
+            await update.effective_message.reply_text(HELP)
+
+    async def _reply_report(self, update: Update, parsed: dict):
+        msgs = pl.answer_question(self.store, self.cfg, parsed, datetime.now(self.cfg.tz))
+        await self.send_messages(update.effective_chat.id, msgs)
+
+    async def cmd_pending(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "pending", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_late(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "late", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_owing(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "owing", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_spent(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        month = next((a for a in ctx.args if re.fullmatch(r"\d{4}-\d{2}", a)), None)
+        kw = " ".join(a for a in ctx.args if a != month) or None
+        await self._reply_report(update, {"intent": "spent", "month": month, "keyword": kw})
+
+    async def cmd_undo(self, update: Update, ctx):
+        if self.authorized(update):
+            await update.effective_message.reply_text(pl.undo_last(self.store))
+
+    async def cmd_status(self, update: Update, ctx):
+        if self.authorized(update):
+            extra = "\n⚠️ Claude is currently unavailable." if self.store.get_setting("ai_down") == "1" else ""
+            failed = self.store.one("SELECT COUNT(*) c FROM inbox WHERE status='failed'")["c"]
+            extra += f"\nMessages that failed to process: {failed}" if failed else ""
+            await update.effective_message.reply_text(pl.status_text(self.store, self.cfg) + extra)
+
+    async def on_message(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        msg = update.effective_message
+        text = msg.text or msg.caption
+        file_id = None
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+        elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+            file_id = msg.document.file_id
+        if not text and not file_id:
+            return
+        origin = msg.forward_origin
+        when = origin.date if origin is not None else msg.date
+        inbox_id = self.store.inbox_add(
+            msg.chat_id, msg.message_id, text, file_id, msg.media_group_id,
+            origin is not None and origin.type == "channel", when.isoformat())
+        await self.process(inbox_id)
+
+    async def on_callback(self, update: Update, ctx):
+        q = update.callback_query
+        await q.answer()
+        if not self.authorized(update):
+            return
+        action, *rest = q.data.split(":")
+        draft_id = int(rest[0])
+        row = self.store.draft_get(draft_id)
+        if not row or row["status"] != "pending":
+            await q.edit_message_reply_markup(None)
+            return
+        cur, tz = self.cfg.currency, self.cfg.tz
+        d = row["data"]
+        if action == "c":
+            result = pl.apply_draft(self.store, draft_id, cur, tz)
+            await q.edit_message_text(pl.render_draft(d, cur, tz) + "\n\n" + result)
+        elif action == "x":
+            self.store.draft_update(draft_id, status="cancelled")
+            await q.edit_message_text("✖️ Cancelled. Nothing saved.")
+        elif action == "m":
+            await q.edit_message_reply_markup(markup(pl.candidate_buttons(draft_id, d)))
+        elif action == "s":
+            d = pl.select_candidate(self.store, draft_id, int(rest[1]))
+            await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
+
+    async def on_error(self, update, ctx: ContextTypes.DEFAULT_TYPE):
+        log.exception("Unhandled error", exc_info=ctx.error)
+        if self.cfg.allowed_user_id and self._rate_limited_alert_due("error_alert", 1):
+            try:
+                await self.send(self.cfg.allowed_user_id,
+                                f"⚠️ Something went wrong inside the bot: {type(ctx.error).__name__}: {ctx.error}")
+            except Exception:  # noqa: BLE001
+                log.exception("Could not send error alert")
+
+    # ------------------------------------------------------------ jobs
+    async def job_retry_queue(self, ctx: ContextTypes.DEFAULT_TYPE):
+        rows = self.store.inbox_queued()
+        if not rows:
+            return
+        announced = False
+        for row in rows:
+            out = await pl.run_inbox_item(self.store, self.parser, self.cfg, row, self._download)
+            if out["type"] == "ai_down":
+                await self.deliver(row["chat_id"], out)
+                return
+            if not announced and self.store.get_setting("ai_down") == "1":
+                self.store.set_setting("ai_down", "0")
+                await self.send(row["chat_id"], f"✅ Claude is back. Processing {len(rows)} saved message(s). "
+                                                "Please confirm the drafts below.")
+            announced = True
+            await self.deliver(row["chat_id"], out)
+
+    async def job_daily_check(self, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = self.cfg.allowed_user_id
+        if not uid:
+            return
+        msgs = pl.due_late_alerts(self.store, self.cfg, datetime.now(self.cfg.tz))
+        if not msgs:
+            return
+        total = sum(len(m["item_ids"]) for m in msgs)
+        weeks = max(self.cfg.late_days // 7, 1)
+        await self.send(uid, f"⏰ {total} item(s) still haven't arrived after {weeks}+ weeks. "
+                             "Time to ask the seller?")
+        sent = pl.cap_messages(msgs)
+        await self.send_messages(uid, sent)
+        for m in sent:
+            self.store.mark_alerted(m.get("item_ids", []), now_iso())
+
+    async def job_health_ping(self, ctx: ContextTypes.DEFAULT_TYPE):
+        url = self.cfg.healthcheck_url
+        if not url:
+            return
+        if self.store.get_setting("ai_down") == "1":
+            url = url.rstrip("/") + "/fail"  # Healthchecks.io: signals failure, so you also get its email
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.get(url)
+        except Exception:  # noqa: BLE001
+            log.warning("Health ping failed")
+
+    # ------------------------------------------------------------ wiring
+    def build(self) -> Application:
+        app = Application.builder().token(self.cfg.telegram_token).build()
+        self.app = app
+        for name, fn in [("start", self.cmd_start), ("help", self.cmd_help), ("pending", self.cmd_pending),
+                         ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
+                         ("undo", self.cmd_undo), ("status", self.cmd_status)]:
+            app.add_handler(CommandHandler(name, fn))
+        app.add_handler(CallbackQueryHandler(self.on_callback))
+        app.add_handler(MessageHandler(
+            (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.IMAGE, self.on_message))
+        app.add_error_handler(self.on_error)
+        jq = app.job_queue
+        jq.run_daily(self.job_daily_check, time=time(self.cfg.daily_check_hour, 0, tzinfo=self.cfg.tz))
+        jq.run_repeating(self.job_retry_queue, interval=900, first=60)
+        if self.cfg.healthcheck_url:
+            jq.run_repeating(self.job_health_ping, interval=300, first=10)
+        return app
