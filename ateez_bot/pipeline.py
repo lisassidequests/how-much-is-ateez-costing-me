@@ -5,6 +5,7 @@ Nothing here talks to Telegram, so it can be tested without a bot token.
 from __future__ import annotations
 
 import difflib
+import itertools
 import json
 import re
 from datetime import datetime, timedelta
@@ -116,6 +117,45 @@ def relink_orders(store: Store) -> int:
     return n
 
 
+MAX_PAY_CANDIDATES = 12
+
+
+def plan_allocation(store: Store, amount: float, order_ids: list[int]):
+    """Spread a payment over the chosen orders, oldest first, each up to what it still owes.
+    Returns ([(order_id, amount_applied, owes)], unallocated_remainder)."""
+    bal = {o["id"]: o for o in store.orders_with_balance()}
+    remaining, plan = round(amount, 2), []
+    for oid in sorted(order_ids):
+        if oid not in bal:
+            continue
+        owes = round(bal[oid]["total_due"] - bal[oid]["paid"], 2)
+        take = round(min(owes, remaining), 2)
+        if owes <= TOL or take <= TOL:
+            continue
+        plan.append((oid, take, owes))
+        remaining = round(remaining - take, 2)
+    return plan, remaining
+
+
+def refresh_payment_plan(store: Store, d: dict) -> dict:
+    labels = {c["id"]: c["label"] for c in d["candidates"]}
+    plan, remainder = plan_allocation(store, d["amount"], d["selected"])
+    d["plan"] = [{"order_id": oid, "label": labels.get(oid, f"Order {oid}"), "amount": amt, "owes": owes}
+                 for oid, amt, owes in plan]
+    d["remainder"] = remainder
+    return d
+
+
+def toggle_payment_order(store: Store, draft_id: int, order_id: int) -> dict:
+    d = store.draft_get(draft_id)["data"]
+    if order_id in {c["id"] for c in d["candidates"]}:
+        d["selected"] = sorted(set(d["selected"]) ^ {order_id})
+    d["warnings"] = [w for w in d["warnings"] if w.startswith("Possible duplicate")]
+    refresh_payment_plan(store, d)
+    store.draft_update(draft_id, data=d)
+    return d
+
+
 def post_candidates(store: Store, title: str, n: int = 5) -> list[dict]:
     scored = sorted(((sim(title, p["title"]), p) for p in store.recent_posts(200)),
                     key=lambda t: t[0], reverse=True)
@@ -180,22 +220,31 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
             return {"kind": "unreadable", "reason": "I couldn't read the payment amount from this screenshot."}
         amount = float(amount)
         outstanding = [o for o in store.orders_with_balance() if o["total_due"] - o["paid"] > TOL]
-        exact = [o for o in outstanding if abs((o["total_due"] - o["paid"]) - amount) <= TOL]
-        order_id = exact[0]["id"] if len(exact) == 1 else None
-        cands = [{"id": o["id"], "label": f"Order {o['id']}: {o['title'][:40]} (owing {o['total_due'] - o['paid']:.2f})"}
-                 for o in outstanding[:6]]
+        cands = [{"id": o["id"], "owes": round(o["total_due"] - o["paid"], 2),
+                  "label": f"Order {o['id']}: {o['title'][:32]}"} for o in outstanding[:MAX_PAY_CANDIDATES]]
+        # one transfer may cover several orders: look for the unique combination of unpaid orders that adds up
+        matches = [[c["id"] for c in combo]
+                   for n in range(1, len(cands) + 1) for combo in itertools.combinations(cands, n)
+                   if abs(sum(c["owes"] for c in combo) - amount) <= TOL]
         warnings = []
-        if order_id is None:
-            warnings.append("No single unpaid order matches this amount exactly. Pick the right one, or confirm to save it unlinked."
-                            if cands else "No unpaid order found; this will be saved unlinked.")
+        if len(matches) == 1:
+            selected = sorted(matches[0])
+        else:
+            selected = []
+            if len(matches) > 1:
+                warnings.append("More than one combination of unpaid orders adds up to this amount. Tick the ones it covers.")
+            elif cands:
+                warnings.append("This amount doesn't match any unpaid order or combination of them. Tick the orders it "
+                                "covers (it counts as a part-payment), or confirm to save it unlinked.")
+            else:
+                warnings.append("No unpaid order found; this will be saved unlinked.")
         paid_at = to_dt(parsed.get("paid_at"), tz, msg_dt).isoformat()
         if find_duplicate_payment(store, amount, paid_at, tz):
             warnings.insert(0, f"Possible duplicate: you already logged a payment of {amount:.2f} on "
                                f"{fmt_date(paid_at, tz)}. Confirm to log it again, or Cancel.")
-        return {"kind": "payment", "amount": amount,
-                "paid_at": paid_at,
-                "reference": parsed.get("reference"), "order_id": order_id,
-                "candidates": cands, "warnings": warnings}
+        return refresh_payment_plan(store, {
+            "kind": "payment", "amount": amount, "paid_at": paid_at, "reference": parsed.get("reference"),
+            "candidates": cands, "selected": selected, "warnings": warnings})
 
     if kind == "arrival_update":
         qty_by_tag: dict[str, str] = {}
@@ -281,8 +330,17 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
         return (f"🛒 Order: {d['title']}\n{lines}{fee}\nTotal: {money(d['total_due'], cur)}{note}\n"
                 f"{link}\nOrdered: {fmt_date(d['ordered_at'], tz)}{warn}")
     if k == "payment":
-        link = f"🔗 Order {d['order_id']}" if d.get("order_id") else "🔗 Not linked to an order"
         ref = f"\nRef: {d['reference']}" if d.get("reference") else ""
+        plan = d.get("plan", [])
+        if plan:
+            link = "Covers:\n" + "\n".join(
+                f"• {p['label']}: {money(p['amount'], cur)}"
+                + (f" of {money(p['owes'], cur)} (part-payment)" if p["amount"] < p["owes"] - TOL else "")
+                for p in plan)
+            if d.get("remainder", 0) > TOL:
+                link += f"\n⚠️ {money(d['remainder'], cur)} isn't allocated to any order."
+        else:
+            link = "🔗 Not linked to any order"
         return f"💸 Payment {money(d['amount'], cur)} on {fmt_date(d['paid_at'], tz)}{ref}\n{link}{warn}"
     if k == "arrival":
         lines = "\n".join(f"• {i}" for i in d["items"])
@@ -303,9 +361,16 @@ def draft_buttons(draft_id: int, d: dict) -> list[list[tuple[str, str]]]:
         rows.append([("☐ Clear all" if all_sel else "☑️ Select all", f"ra:{draft_id}")])
         rows.append([(f"✅ Confirm ({len(sel)})", f"rc:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")])
         return rows
+    if d["kind"] == "payment":  # tick the orders this payment covers
+        sel = set(d["selected"])
+        marks = [(f"{'☑️' if c['id'] in sel else '☐'} Order {c['id']} · {c['owes']:.2f}", f"o:{draft_id}:{c['id']}")
+                 for c in d["candidates"]]
+        rows = [marks[i:i + 2] for i in range(0, len(marks), 2)]
+        rows.append([("✅ Confirm", f"c:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")])
+        return rows
     rows = [[("✅ Confirm", f"c:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")]]
-    if d["kind"] in ("order", "payment") and d.get("candidates"):
-        rows.append([("🔗 Change link" if d["kind"] == "order" else "🔗 Pick order", f"m:{draft_id}")])
+    if d["kind"] == "order" and d.get("candidates"):
+        rows.append([("🔗 Change link", f"m:{draft_id}")])
     return rows
 
 
@@ -322,9 +387,6 @@ def select_candidate(store: Store, draft_id: int, idx: int) -> dict:
     if d["kind"] == "order":
         post = store.get_post(cand["id"]) if cand else None
         d["post_id"], d["post_tag"] = (post["id"], post["tag"]) if post else (None, None)
-    elif d["kind"] == "payment":
-        d["order_id"] = cand["id"] if cand else None
-        d["warnings"] = []
     store.draft_update(draft_id, data=d)
     return d
 
@@ -347,13 +409,21 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
         text = (f"✅ Order {oid} saved: {len(item_ids)} item(s), {money(d['total_due'], cur)}.\n"
                 "Send your payment screenshot when you've paid.")
     elif k == "payment":
-        pid = store.add_payment(d.get("order_id"), d["amount"], d["paid_at"], d.get("reference"))
+        plan, remainder = plan_allocation(store, d["amount"], d["selected"])
+        pid = store.add_payment(d["amount"], d["paid_at"], d.get("reference"))
+        for oid, amt, _owes in plan:
+            store.add_allocation(pid, oid, amt)
         result = {"type": "payment", "payment_id": pid}
         text = f"✅ Logged {money(d['amount'], cur)}."
-        if d.get("order_id"):
-            o = next(o for o in store.orders_with_balance() if o["id"] == d["order_id"])
-            left = o["total_due"] - o["paid"]
-            text += f" Order {o['id']} balance: {money(max(left, 0), cur)}."
+        if plan:
+            bal = {o["id"]: o for o in store.orders_with_balance()}
+            text += "".join(
+                f"\n• Order {oid}: {money(amt, cur)} paid, balance {money(max(bal[oid]['total_due'] - bal[oid]['paid'], 0), cur)}"
+                for oid, amt, _owes in plan)
+            if remainder > TOL:
+                text += f"\n⚠️ {money(remainder, cur)} wasn't allocated to any order."
+        else:
+            text += " (not linked to an order)"
     elif k == "arrival":
         fresh = [r["id"] for r in store.all(
             f"SELECT id FROM items WHERE arrived_at IS NULL AND id IN ({','.join('?' * len(d['item_ids']))})",
@@ -571,26 +641,37 @@ def batch_caption(store: Store, cfg: Config, post_id: int, now: datetime) -> str
 
 
 def spent_text(store: Store, cfg: Config, month: str | None, keyword: str | None) -> str:
+    """Spend = what you actually paid. A payment covering several orders is split across them by allocation."""
     cur = cfg.currency
-    pays = [p for p in store.all_payments()
-            if (not month or to_dt(p["paid_at"], cfg.tz).astimezone(cfg.tz).strftime("%Y-%m") == month)
-            and keyword_ok(keyword, p["order_title"], p["post_title"], p["tag"], p["item_names"], p["reference"])]
+    spend = []  # (payment_id, local datetime, amount, batch label)
+    for p in store.payments_with_allocations():
+        local = to_dt(p["paid_at"], cfg.tz).astimezone(cfg.tz)
+        if month and local.strftime("%Y-%m") != month:
+            continue
+        allocated = 0.0
+        for a in p["allocs"]:
+            allocated += a["amount"]
+            if keyword_ok(keyword, a["order_title"], a["post_title"], a["tag"], a["item_names"], p["reference"]):
+                spend.append((p["id"], local, a["amount"],
+                              f"#{a['tag']}" if a["tag"] else (a["order_title"] or "unlinked")[:40]))
+        rest = round(p["amount"] - allocated, 2)
+        if rest > TOL and keyword_ok(keyword, p["reference"]):
+            spend.append((p["id"], local, rest, "not allocated to an order"))
     label = " ".join(x for x in [keyword, month] if x) or "all time"
-    if not pays:
+    if not spend:
         return f"No payments recorded ({label})."
-    total = sum(p["amount"] for p in pays)
-    lines = [f"💰 Spent ({label}): {money(total, cur)} across {len(pays)} payment(s)"]
+    total = sum(x[2] for x in spend)
+    lines = [f"💰 Spent ({label}): {money(total, cur)} across {len({x[0] for x in spend})} payment(s)"]
     if not month:
         by_month: dict[str, float] = {}
-        for p in pays:
-            m = to_dt(p["paid_at"], cfg.tz).astimezone(cfg.tz).strftime("%Y-%m")
-            by_month[m] = by_month.get(m, 0) + p["amount"]
+        for _pid, local, amt, _k in spend:
+            m = local.strftime("%Y-%m")
+            by_month[m] = by_month.get(m, 0) + amt
         lines.append("\nBy month:")
         lines += [f"• {m}: {money(v, cur)}" for m, v in sorted(by_month.items())]
     by_batch: dict[str, float] = {}
-    for p in pays:
-        key = f"#{p['tag']}" if p["tag"] else (p["order_title"] or "unlinked payment")[:40]
-        by_batch[key] = by_batch.get(key, 0) + p["amount"]
+    for _pid, _local, amt, key in spend:
+        by_batch[key] = by_batch.get(key, 0) + amt
     lines.append("\nBy batch:")
     lines += [f"• {k}: {money(v, cur)}" for k, v in sorted(by_batch.items(), key=lambda kv: -kv[1])[:10]]
     return "\n".join(lines)

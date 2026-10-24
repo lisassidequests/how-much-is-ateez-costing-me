@@ -104,11 +104,11 @@ def test_full_flow_screenshot_examples(env):
     # payment screenshots link to the order with the exactly matching balance
     pay = {"kind": "payment_proof", "summary": "paynow", "amount": 114.0, "paid_at": None, "reference": "lisa"}
     out = ingest(store, FakeParser(pay), cfg, photo="SHOT1")
-    assert out["draft"]["order_id"] == 1
+    assert out["draft"]["selected"] == [1]
     confirm(store, out, cfg)
     pay2 = dict(pay, amount=15.5)
     out = ingest(store, FakeParser(pay2), cfg, photo="SHOT2")
-    assert out["draft"]["order_id"] == 2
+    assert out["draft"]["selected"] == [2]
     confirm(store, out, cfg)
 
     assert "S$129.50" in pl.spent_text(store, cfg, None, None)
@@ -171,14 +171,91 @@ def test_late_flag_uses_payment_date_and_weekly_digest(env):
     assert pl.weekly_digest(store, cfg, now) == []
 
 
-def test_ambiguous_payment_asks_instead_of_guessing(env):
+def pay_msg(amount, paid_at=None):
+    return {"kind": "payment_proof", "summary": "paynow", "amount": amount, "paid_at": paid_at, "reference": None}
+
+
+def balances(store):
+    return {o["id"]: round(o["total_due"] - o["paid"], 2) for o in store.orders_with_balance()}
+
+
+def test_one_payment_covering_several_orders(env):
+    cfg, store = env
+    setup_orders(store, cfg, datetime.now(TZ))                      # order 1 owes 114.00, order 2 owes 15.50
+    out = ingest(store, FakeParser(pay_msg(129.5)), cfg, photo="S")
+    d = out["draft"]
+    assert d["selected"] == [1, 2] and d["remainder"] == 0           # the only combination that adds up
+    text = pl.render_draft(d, "S$", TZ)
+    assert "Covers:" in text and "Order 1" in text and "Order 2" in text and "⚠️" not in text
+    msg = confirm(store, out, cfg)
+    assert "Order 1: S$114.00 paid, balance S$0.00" in msg and "Order 2: S$15.50 paid, balance S$0.00" in msg
+    assert balances(store) == {1: 0.0, 2: 0.0}
+    assert "Nothing owing" in pl.owing_text(store, cfg)
+    spent = pl.spent_text(store, cfg, None, None)
+    assert "S$129.50 across 1 payment(s)" in spent and "#anghp5_2: S$114.00" in spent
+    assert "S$15.50" in pl.spent_text(store, cfg, None, "mingi")      # the share that went to the Mingi/Hongjoong order
+    # undoing the payment reopens both orders
+    assert "Removed the last payment" in pl.undo_last(store)
+    assert balances(store) == {1: 114.0, 2: 15.5}
+
+
+def test_payment_picks_unique_combination_among_many_orders(env):
     cfg, store = env
     setup_orders(store, cfg, datetime.now(TZ))
-    pay = {"kind": "payment_proof", "summary": "x", "amount": 50.0}
-    out = ingest(store, FakeParser(pay), cfg, photo="S")
-    assert out["draft"]["order_id"] is None and len(out["draft"]["candidates"]) == 2
-    d = pl.select_candidate(store, out["draft_id"], 0)
-    assert d["order_id"] == out["draft"]["candidates"][0]["id"]
+    store.add_order(None, "third order", 21.5, None, None, datetime.now(TZ).isoformat(), "x",
+                    [{"name": "SAN", "qty": 1, "line_total": 21.5}])
+    d = ingest(store, FakeParser(pay_msg(135.5)), cfg, photo="S")["draft"]   # 114 + 21.5
+    assert d["selected"] == [1, 3]
+    assert ingest(store, FakeParser(pay_msg(37.0)), cfg, photo="S")["draft"]["selected"] == [2, 3]  # 15.5 + 21.5
+
+
+def test_ambiguous_or_unmatched_payment_asks_you_to_tick(env):
+    cfg, store = env
+    setup_orders(store, cfg, datetime.now(TZ))
+    store.add_order(None, "twin order", 15.5, None, None, datetime.now(TZ).isoformat(), "x",
+                    [{"name": "SAN", "qty": 1, "line_total": 15.5}])         # same balance as order 2
+    d = ingest(store, FakeParser(pay_msg(15.5)), cfg, photo="S")["draft"]
+    assert d["selected"] == [] and "More than one combination" in d["warnings"][0]
+    assert len(d["candidates"]) == 3
+
+    out = ingest(store, FakeParser(pay_msg(50.0)), cfg, photo="S")           # matches nothing: treat as part-payment
+    assert out["draft"]["selected"] == [] and "doesn't match" in out["draft"]["warnings"][0]
+    d = pl.toggle_payment_order(store, out["draft_id"], 1)
+    assert d["selected"] == [1] and d["plan"][0]["amount"] == 50.0 and d["warnings"] == []
+    assert "part-payment" in pl.render_draft(d, "S$", TZ)
+    assert any("☑️ Order 1" in b[0] for row in pl.draft_buttons(out["draft_id"], d) for b in row)
+    assert pl.toggle_payment_order(store, out["draft_id"], 1)["selected"] == []     # tap again to untick
+    pl.toggle_payment_order(store, out["draft_id"], 1)
+    confirm(store, out, cfg)
+    assert balances(store)[1] == 64.0
+    # the follow-up payment for the rest matches exactly
+    assert ingest(store, FakeParser(pay_msg(64.0)), cfg, photo="S")["draft"]["selected"] == [1]
+
+
+def test_overpayment_leaves_a_visible_remainder(env):
+    cfg, store = env
+    setup_orders(store, cfg, datetime.now(TZ))
+    out = ingest(store, FakeParser(pay_msg(200.0)), cfg, photo="S")
+    d = pl.toggle_payment_order(store, out["draft_id"], 1)
+    d = pl.toggle_payment_order(store, out["draft_id"], 2)
+    assert d["remainder"] == 70.5 and "S$70.50 isn't allocated" in pl.render_draft(d, "S$", TZ)
+    msg = confirm(store, out, cfg)
+    assert "S$70.50 wasn't allocated" in msg and balances(store) == {1: 0.0, 2: 0.0}
+    assert "S$200.00" in pl.spent_text(store, cfg, None, None)               # you did pay 200
+
+
+def test_old_single_order_payments_are_migrated(tmp_path):
+    path = str(tmp_path / "pay.db")
+    store = Store(path)
+    store.add_order(None, "t", 15.5, None, None, datetime.now(TZ).isoformat(), "x",
+                    [{"name": "A", "qty": 1, "line_total": 15.5}])
+    store.run("INSERT INTO payments(order_id,amount,paid_at,created_at) VALUES(1, 15.5, '2026-10-01T00:00:00+08:00', 'x')")
+    store.db.close()
+    reopened = Store(path)                                    # what happens when the VM gets the new version
+    assert balances(reopened) == {1: 0.0}
+    assert reopened.one("SELECT order_id FROM payments")["order_id"] is None
+    Store(path)                                               # a second restart must not double count
+    assert balances(Store(path)) == {1: 0.0}
 
 
 def test_credits_exhausted_queues_then_recovers(env):

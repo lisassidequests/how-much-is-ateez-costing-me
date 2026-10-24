@@ -38,7 +38,7 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
      of the post it clearly refers to (same product/event and version), else null. Do not guess
      between near-identical versions; use match_confidence low in that case.
 
-3. payment_proof - a screenshot of a bank/PayNow/PayLah transfer. Return amount, paid_at (ISO 8601 date or
+3. payment_proof - a screenshot of a bank/PayNow/PayLah transfer. Return amount (the total transferred, even if it covers several orders), paid_at (ISO 8601 date or
    datetime as shown on the screenshot, else null) and reference (any recipient/comment text).
 
 4. arrival_update - the seller announcing that items have reached her. Often a mass "[ARRIVAL PROOF]" post,

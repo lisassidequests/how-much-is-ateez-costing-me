@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS payments (
   reference TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS allocations (
+  id INTEGER PRIMARY KEY,
+  payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  amount REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS inbox (
   id INTEGER PRIMARY KEY,
   chat_id INTEGER NOT NULL,
@@ -95,6 +101,10 @@ class Store:
         for table, column in (("items", "received_at"), ("inbox", "fingerprint")):
             if column not in {r["name"] for r in self.all(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        # payments used to link to a single order (payments.order_id); they now split across orders via allocations
+        self.db.execute("INSERT INTO allocations(payment_id,order_id,amount) SELECT id, order_id, amount FROM payments "
+                        "WHERE order_id IS NOT NULL AND id NOT IN (SELECT payment_id FROM allocations)")
+        self.db.execute("UPDATE payments SET order_id=NULL WHERE order_id IS NOT NULL")
         self.db.commit()
 
     # -- helpers -----------------------------------------------------------
@@ -243,24 +253,29 @@ class Store:
             ))
         return oid, item_ids
 
-    def add_payment(self, order_id, amount, paid_at, reference) -> int:
+    def add_payment(self, amount, paid_at, reference) -> int:
         return self.run(
-            "INSERT INTO payments(order_id,amount,paid_at,reference,created_at) VALUES(?,?,?,?,?)",
-            (order_id, amount, paid_at, reference, now_iso()),
+            "INSERT INTO payments(amount,paid_at,reference,created_at) VALUES(?,?,?,?)",
+            (amount, paid_at, reference, now_iso()),
         )
+
+    def add_allocation(self, payment_id: int, order_id: int, amount: float) -> int:
+        """Say how much of a payment went towards an order. One payment can have several."""
+        return self.run("INSERT INTO allocations(payment_id,order_id,amount) VALUES(?,?,?)",
+                        (payment_id, order_id, amount))
 
     def orders_with_balance(self):
         """Every order with how much has been paid so far."""
         return self.all(
-            "SELECT o.*, COALESCE((SELECT SUM(amount) FROM payments WHERE order_id=o.id),0) AS paid, "
-            "(SELECT MIN(paid_at) FROM payments WHERE order_id=o.id) AS first_paid "
+            "SELECT o.*, COALESCE((SELECT SUM(amount) FROM allocations WHERE order_id=o.id),0) AS paid, "
+            "(SELECT MIN(pay.paid_at) FROM payments pay JOIN allocations a ON a.payment_id=pay.id WHERE a.order_id=o.id) AS first_paid "
             "FROM orders o ORDER BY o.id DESC"
         )
 
     def items_pending(self):
         return self.all(
             "SELECT i.*, o.title AS order_title, o.ordered_at, p.tag, p.title AS post_title, "
-            "p.image_file_ids, (SELECT MIN(paid_at) FROM payments WHERE order_id=o.id) AS first_paid "
+            "p.image_file_ids, (SELECT MIN(pay.paid_at) FROM payments pay JOIN allocations a ON a.payment_id=pay.id WHERE a.order_id=o.id) AS first_paid "
             "FROM items i JOIN orders o ON o.id=i.order_id LEFT JOIN posts p ON p.id=i.post_id "
             "WHERE i.arrived_at IS NULL ORDER BY o.ordered_at"
         )
@@ -277,16 +292,21 @@ class Store:
 
     def items_for_post(self, post_id: int):
         return self.all(
-            "SELECT i.*, o.ordered_at, (SELECT MIN(paid_at) FROM payments WHERE order_id=o.id) AS first_paid "
+            "SELECT i.*, o.ordered_at, (SELECT MIN(pay.paid_at) FROM payments pay JOIN allocations a ON a.payment_id=pay.id WHERE a.order_id=o.id) AS first_paid "
             "FROM items i JOIN orders o ON o.id=i.order_id WHERE i.post_id=? ORDER BY i.id", (post_id,))
 
-    def all_payments(self):
-        return self.all(
-            "SELECT pay.*, o.title AS order_title, p.tag, p.title AS post_title, "
-            "(SELECT GROUP_CONCAT(name, ' ') FROM items WHERE order_id=o.id) AS item_names "
-            "FROM payments pay LEFT JOIN orders o ON o.id=pay.order_id "
-            "LEFT JOIN posts p ON p.id=o.post_id ORDER BY pay.paid_at"
-        )
+    def payments_with_allocations(self):
+        """Every payment with the orders it was allocated to (a payment can cover several)."""
+        out = []
+        for p in self.all("SELECT * FROM payments ORDER BY paid_at"):
+            allocs = self.all(
+                "SELECT a.amount, a.order_id, o.title AS order_title, po.tag, po.title AS post_title, "
+                "(SELECT GROUP_CONCAT(name, ' ') FROM items WHERE order_id=o.id) AS item_names "
+                "FROM allocations a JOIN orders o ON o.id=a.order_id LEFT JOIN posts po ON po.id=o.post_id "
+                "WHERE a.payment_id=?", (p["id"],))
+            out.append({"id": p["id"], "amount": p["amount"], "paid_at": p["paid_at"],
+                        "reference": p["reference"], "allocs": allocs})
+        return out
 
     def mark_received(self, item_ids, when: str) -> None:
         for iid in item_ids:

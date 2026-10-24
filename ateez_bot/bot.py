@@ -249,6 +249,10 @@ class BotApp:
             return
         cur, tz = self.cfg.currency, self.cfg.tz
         d = row["data"]
+        if action == "o":  # tick/untick an order on a payment
+            d = pl.toggle_payment_order(self.store, draft_id, int(rest[1]))
+            await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
+            return
         if action in ("r", "ra"):  # toggle one item / select-all on a /received list
             d = pl.toggle_received(self.store, draft_id, int(rest[1]) if action == "r" else None)
             await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
