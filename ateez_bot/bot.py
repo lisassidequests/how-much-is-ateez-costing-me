@@ -33,7 +33,8 @@ HELP = (
     "/owing: unpaid or part-paid orders\n"
     "/undo: reverse the last thing you confirmed\n"
     "/status [name]: everything you're still expecting, with a button per # for the photos\n"
-    "/delivered [name]: what has arrived, with the same # photo buttons\n"
+    "/delivered [name]: arrived with the seller but not with you yet (# buttons too)\n"
+    "/received [name]: tick off what has reached you\n"
     "/healthcheck: is the bot running OK?\n"
     "You can also just ask, e.g. \"how much have I spent on ateez this month?\""
 )
@@ -173,6 +174,19 @@ class BotApp:
         if self.authorized(update):
             await self._reply_report(update, {"intent": "delivered", "keyword": " ".join(ctx.args) or None})
 
+    async def cmd_received(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        drafts = pl.received_drafts(self.store, self.cfg, " ".join(ctx.args) or None)
+        if not drafts:
+            await update.effective_message.reply_text(
+                "Nothing is waiting to reach you. Items show up here once the seller confirms they've arrived.")
+            return
+        for d in drafts:
+            draft_id = self.store.draft_add("received", d)
+            await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                            reply_markup=markup(pl.draft_buttons(draft_id, d)))
+
     async def send_batch(self, chat_id: int, post_id: int) -> None:
         """Photos of one post (what you ordered), with item statuses as the caption."""
         post = self.store.get_post(post_id)
@@ -229,6 +243,15 @@ class BotApp:
             return
         cur, tz = self.cfg.currency, self.cfg.tz
         d = row["data"]
+        if action in ("r", "ra"):  # toggle one item / select-all on a /received list
+            d = pl.toggle_received(self.store, draft_id, int(rest[1]) if action == "r" else None)
+            await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
+            return
+        if action == "rc":
+            if d["selected"]:
+                result = pl.apply_draft(self.store, draft_id, cur, tz)
+                await q.edit_message_text(pl.render_draft(d, cur, tz) + "\n\n" + result)
+            return
         if action == "c":
             result = pl.apply_draft(self.store, draft_id, cur, tz)
             await q.edit_message_text(pl.render_draft(d, cur, tz) + "\n\n" + result)
@@ -296,7 +319,8 @@ class BotApp:
                 ("pending", "What hasn't arrived yet (text list)"),
                 ("pending_photos", "What hasn't arrived yet, with photos"),
                 ("status", "Everything I'm still expecting (tap # for photos)"),
-                ("delivered", "What has arrived (tap # for photos)"),
+                ("delivered", "Arrived with the seller, not yet with me"),
+                ("received", "Mark what has reached me"),
                 ("late", "Items past the late threshold"),
                 ("spent", "How much I've spent"),
                 ("owing", "Unpaid or part-paid orders"),
@@ -311,7 +335,8 @@ class BotApp:
                          ("pending_photos", self.cmd_pending_photos),
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
-                         ("status", self.cmd_status), ("delivered", self.cmd_delivered)]:
+                         ("status", self.cmd_status), ("delivered", self.cmd_delivered),
+                         ("received", self.cmd_received)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(

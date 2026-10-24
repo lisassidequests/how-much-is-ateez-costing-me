@@ -292,17 +292,62 @@ def test_status_and_delivered_overviews_have_photo_buttons(env):
     assert labels == ["#anghp5_2"]                       # the unlinked batch has no # to tap
     post_id = store.get_post_by_tag("anghp5_2")["id"]
     assert msgs[0]["buttons"][0][0][1] == f"t:{post_id}"
-    assert pl.answer_question(store, cfg, {"intent": "delivered"}, now)[0]["text"] == "Nothing has arrived yet."
+    assert pl.answer_question(store, cfg, {"intent": "delivered"}, now)[0]["text"] == "Nothing is waiting to reach you."
 
     arr = {"kind": "arrival_update", "summary": "x", "tags": ["anghp5_2"], "names": []}
     confirm(store, ingest(store, FakeParser(arr), cfg, text="#anghp5_2 arrived"), cfg)
     delivered = pl.answer_question(store, cfg, {"intent": "delivered"}, now)[0]
-    assert "Arrived: 2 item(s) in 1 batch(es)" in delivered["text"]
+    assert "2 item(s) in 1 batch(es)" in delivered["text"]
     assert delivered["buttons"][0][0][0] == "#anghp5_2"
     status = pl.answer_question(store, cfg, {"intent": "status"}, now)[0]
     assert "2 item(s) in 1 batch(es)" in status["text"] and status["buttons"] is None
     cap = pl.batch_caption(store, cfg, post_id, now)
     assert "✅ OT8 INDIVIDUAL ×8" in cap and cap.startswith("#anghp5_2")
+
+
+def test_received_workflow(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    setup_orders(store, cfg, now)
+    assert pl.received_drafts(store, cfg) == []                       # nothing has reached the seller yet
+    arr = {"kind": "arrival_update", "summary": "x", "tags": ["anghp5_2"], "names": []}
+    assert "/received" in confirm(store, ingest(store, FakeParser(arr), cfg, text="#anghp5_2 arrived"), cfg)
+
+    drafts = pl.received_drafts(store, cfg)
+    assert len(drafts) == 1 and len(drafts[0]["items"]) == 2
+    did = store.draft_add("received", drafts[0])
+    assert "☐ OT8 INDIVIDUAL" in pl.render_draft(drafts[0], "S$", TZ)   # nothing pre-selected
+    ids = [i["id"] for i in drafts[0]["items"]]
+    d = pl.toggle_received(store, did, ids[0])
+    assert d["selected"] == [ids[0]]
+    assert any("Confirm (1)" in b[0] for row in pl.draft_buttons(did, d) for b in row)
+    assert len(pl.toggle_received(store, did)["selected"]) == 2        # select all
+    assert pl.toggle_received(store, did)["selected"] == []            # ...and clear
+    pl.toggle_received(store, did, ids[0])
+    msg = pl.apply_draft(store, did, "S$", TZ)
+    assert "Marked 1 item(s) as received. 1 item(s) still waiting" in msg
+
+    # /delivered now lists only the one still to reach you, and counts the received one
+    text = pl.answer_question(store, cfg, {"intent": "delivered"}, now)[0]["text"]
+    assert "1 item(s) in 1 batch(es)" in text and "1 item(s) already received" in text
+    assert "📬" in pl.batch_caption(store, cfg, store.get_post_by_tag("anghp5_2")["id"], now)
+    assert len(pl.received_drafts(store, cfg)[0]["items"]) == 1
+
+    assert "not received" in pl.undo_last(store)
+    assert len(pl.received_drafts(store, cfg)[0]["items"]) == 2
+
+
+def test_old_database_gets_received_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, post_id INTEGER, "
+                "name TEXT NOT NULL, qty INTEGER NOT NULL DEFAULT 1, line_total REAL NOT NULL DEFAULT 0, "
+                "arrived_at TEXT, last_alert_at TEXT)")
+    con.commit()
+    con.close()
+    store = Store(path)
+    assert "received_at" in [r["name"] for r in store.all("PRAGMA table_info(items)")]
 
 
 def test_fallback_tag():

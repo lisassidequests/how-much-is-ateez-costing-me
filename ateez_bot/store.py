@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS items (
   qty INTEGER NOT NULL DEFAULT 1,
   line_total REAL NOT NULL DEFAULT 0,
   arrived_at TEXT,
+  received_at TEXT,
   last_alert_at TEXT
 );
 CREATE TABLE IF NOT EXISTS payments (
@@ -89,6 +90,9 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        # migration for databases created before the "received" step existed
+        if "received_at" not in {r["name"] for r in self.all("PRAGMA table_info(items)")}:
+            self.db.execute("ALTER TABLE items ADD COLUMN received_at TEXT")
         self.db.commit()
 
     # -- helpers -----------------------------------------------------------
@@ -252,12 +256,14 @@ class Store:
             "WHERE i.arrived_at IS NULL ORDER BY o.ordered_at"
         )
 
-    def items_arrived(self):
+    def items_arrived(self, unreceived_only: bool = False):
+        """Items that have reached the seller (optionally only those you haven't received yet)."""
         return self.all(
             "SELECT i.*, o.title AS order_title, o.ordered_at, p.tag, p.title AS post_title, "
             "p.image_file_ids "
             "FROM items i JOIN orders o ON o.id=i.order_id LEFT JOIN posts p ON p.id=i.post_id "
-            "WHERE i.arrived_at IS NOT NULL ORDER BY i.arrived_at DESC"
+            "WHERE i.arrived_at IS NOT NULL" + (" AND i.received_at IS NULL" if unreceived_only else "")
+            + " ORDER BY i.arrived_at DESC"
         )
 
     def items_for_post(self, post_id: int):
@@ -272,6 +278,10 @@ class Store:
             "FROM payments pay LEFT JOIN orders o ON o.id=pay.order_id "
             "LEFT JOIN posts p ON p.id=o.post_id ORDER BY pay.paid_at"
         )
+
+    def mark_received(self, item_ids, when: str) -> None:
+        for iid in item_ids:
+            self.run("UPDATE items SET received_at=? WHERE id=? AND received_at IS NULL", (when, iid))
 
     def mark_arrived(self, item_ids, when: str) -> None:
         for iid in item_ids:

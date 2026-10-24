@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .ai import AIUnavailable, fallback_tag, fallback_tags
 from .config import Config
-from .store import Store
+from .store import Store, now_iso
 
 TOL = 0.011  # money comparison tolerance (1 cent)
 MAX_GROUPS = 10  # max photo messages sent in one reply
@@ -193,6 +193,17 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
 def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
     k = d["kind"]
     warn = "".join(f"\n⚠️ {w}" for w in d.get("warnings", []))
+    if k == "received":
+        sel = set(d["selected"])
+        groups: dict[str, list] = {}
+        for it in d["items"]:
+            groups.setdefault(it["head"], []).append(it)
+        lines = ["📬 These have reached the seller. Tap the ones that have reached YOU, then Confirm."]
+        for head, its in groups.items():
+            lines.append(f"\n{head}")
+            lines += [f"{'☑️' if it['id'] in sel else '☐'} {it['name']} ×{it['qty']} "
+                      f"(arrived {fmt_date(it['arrived_at'], tz)})" for it in its]
+        return "\n".join(lines)
     if k == "channel_post":
         extra = f"\n{d['price_note']}" if d.get("price_note") else ""
         status = "\n(already saved; this will update it)" if d.get("exists") else ""
@@ -219,6 +230,15 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
 
 
 def draft_buttons(draft_id: int, d: dict) -> list[list[tuple[str, str]]]:
+    if d["kind"] == "received":
+        sel = set(d["selected"])
+        marks = [(f"{'☑️' if it['id'] in sel else '☐'} {it['name']}" + (f" (#{it['tag']})" if it["tag"] else ""),
+                  f"r:{draft_id}:{it['id']}") for it in d["items"]]
+        all_sel = len(sel) == len(d["items"])
+        rows = [marks[i:i + 2] for i in range(0, len(marks), 2)]
+        rows.append([("☐ Clear all" if all_sel else "☑️ Select all", f"ra:{draft_id}")])
+        rows.append([(f"✅ Confirm ({len(sel)})", f"rc:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")])
+        return rows
     rows = [[("✅ Confirm", f"c:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")]]
     if d["kind"] in ("order", "payment") and d.get("candidates"):
         rows.append([("🔗 Change link" if d["kind"] == "order" else "🔗 Pick order", f"m:{draft_id}")])
@@ -274,7 +294,16 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
         store.mark_arrived(fresh, d["arrived_at"])
         result = {"type": "arrival", "item_ids": fresh}
         left = len(store.items_pending())
-        text = f"✅ Marked {len(fresh)} item(s) as arrived. {left} item(s) still pending."
+        text = (f"✅ Marked {len(fresh)} item(s) as arrived. {left} item(s) still pending. "
+                "When they reach you, use /received.")
+    elif k == "received":
+        ids = d["selected"]
+        fresh = [r["id"] for r in store.all(
+            f"SELECT id FROM items WHERE received_at IS NULL AND id IN ({','.join('?' * len(ids))})", ids)] if ids else []
+        store.mark_received(fresh, now_iso())
+        result = {"type": "received", "item_ids": fresh}
+        left = store.one("SELECT COUNT(*) c FROM items WHERE arrived_at IS NOT NULL AND received_at IS NULL")["c"]
+        text = f"✅ Marked {len(fresh)} item(s) as received. {left} item(s) still waiting to reach you."
     else:
         raise ValueError(f"Cannot apply draft kind {k}")
     store.draft_update(draft_id, status="confirmed", result=result)
@@ -300,6 +329,11 @@ def undo_last(store: Store) -> str:
     elif r["type"] == "payment":
         store.run("DELETE FROM payments WHERE id=?", (r["payment_id"],))
         msg = "Removed the last payment."
+    elif r["type"] == "received":
+        if r["item_ids"]:
+            store.run(f"UPDATE items SET received_at=NULL WHERE id IN ({','.join('?' * len(r['item_ids']))})",
+                      r["item_ids"])
+        msg = f"Marked {len(r['item_ids'])} item(s) as not received again."
     else:
         if r["item_ids"]:
             store.run(f"UPDATE items SET arrived_at=NULL WHERE id IN ({','.join('?' * len(r['item_ids']))})",
@@ -378,7 +412,7 @@ BATCHES_PER_MESSAGE = 12
 def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str | None = None) -> list[dict]:
     """mode 'expecting' = not arrived yet, 'delivered' = arrived. One message per batch group, each batch has a
     tappable #serial button (callback t:<post_id>) that sends that post's photos."""
-    rows = store.items_pending() if mode == "expecting" else store.items_arrived()
+    rows = store.items_pending() if mode == "expecting" else store.items_arrived(unreceived_only=True)
     rows = [r for r in rows if keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
     if not rows:
         return []
@@ -401,8 +435,9 @@ def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str |
         if late:
             header += f"\n⚠️ {late} batch(es) past {cfg.late_days // 7} weeks. Maybe ask the seller?"
     else:
-        header = (f"✅ Arrived: {n_items} item(s) in {len(ordered)} batch(es). "
-                  "These have reached the seller; mailing to you is separate.")
+        got = store.one("SELECT COUNT(*) c FROM items WHERE received_at IS NOT NULL")["c"]
+        header = (f"📬 Reached the seller, not yet received by you: {n_items} item(s) in {len(ordered)} batch(es)\n"
+                  "Use /received when they reach you." + (f"\n✔️ {got} item(s) already received." if got else ""))
     msgs = []
     for i in range(0, len(ordered), BATCHES_PER_MESSAGE):
         chunk = ordered[i:i + BATCHES_PER_MESSAGE]
@@ -420,6 +455,37 @@ def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str |
     return msgs
 
 
+RECEIVED_PER_MESSAGE = 30
+
+
+def received_drafts(store: Store, cfg: Config, keyword: str | None = None) -> list[dict]:
+    """Items that have reached the seller but that you haven't marked received, as selectable drafts."""
+    rows = [r for r in store.items_arrived(unreceived_only=True)
+            if keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
+    rows.sort(key=lambda r: (r["tag"] or f"~{r['order_id']}", r["id"]))
+    drafts = []
+    for i in range(0, len(rows), RECEIVED_PER_MESSAGE):
+        drafts.append({"kind": "received", "selected": [], "items": [
+            {"id": r["id"], "name": r["name"], "qty": r["qty"], "tag": r["tag"], "arrived_at": r["arrived_at"],
+             "head": f"#{r['tag']} {r['post_title']}" if r["tag"] else f"{r['order_title']} (no post linked)"}
+            for r in rows[i:i + RECEIVED_PER_MESSAGE]]})
+    return drafts
+
+
+def toggle_received(store: Store, draft_id: int, item_id: int | None = None) -> dict:
+    """Toggle one item, or (item_id=None) select everything / clear everything."""
+    d = store.draft_get(draft_id)["data"]
+    ids = [i["id"] for i in d["items"]]
+    sel = set(d["selected"])
+    if item_id is None:
+        sel = set() if sel == set(ids) else set(ids)
+    elif item_id in ids:
+        sel ^= {item_id}
+    d["selected"] = sorted(sel)
+    store.draft_update(draft_id, data=d)
+    return d
+
+
 def batch_caption(store: Store, cfg: Config, post_id: int, now: datetime) -> str:
     """Caption for the photos of one post: every item you ordered under it, with status."""
     post = store.get_post(post_id)
@@ -428,8 +494,10 @@ def batch_caption(store: Store, cfg: Config, post_id: int, now: datetime) -> str
     if not items:
         lines.append("(no orders saved against this post yet)")
     for r in items:
-        if r["arrived_at"]:
-            lines.append(f"✅ {r['name']} ×{r['qty']}: arrived {fmt_date(r['arrived_at'], cfg.tz)}")
+        if r["received_at"]:
+            lines.append(f"📬 {r['name']} ×{r['qty']}: received {fmt_date(r['received_at'], cfg.tz)}")
+        elif r["arrived_at"]:
+            lines.append(f"✅ {r['name']} ×{r['qty']}: arrived with seller {fmt_date(r['arrived_at'], cfg.tz)}")
         else:
             lines.append(f"⏳ {r['name']} ×{r['qty']}: {(now - clock_start(r, cfg.tz)).days}d waiting")
     return "\n".join(lines)[:1000]
@@ -482,7 +550,7 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
     if intent in ("status", "delivered"):
         mode = "expecting" if intent == "status" else "delivered"
         return overview(store, cfg, now, mode, kw) or [{"text": "🎉 Nothing pending." if intent == "status"
-                                                         else "Nothing has arrived yet."}]
+                                                         else "Nothing is waiting to reach you."}]
     if intent == "pending":  # compact text list of everything not arrived, late or not
         chunks = weekly_digest(store, cfg, now, kw)
         return [{"text": c} for c in chunks] or [{"text": "🎉 Nothing pending."}]

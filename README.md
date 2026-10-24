@@ -12,10 +12,10 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 | Seller's "arrived" update | Marks the items arrived (by `#serial`, and member names if given) |
 
 ## Commands
-`/pending [name]` (text list of everything not arrived, late or not) · `/pending_photos [name]` (same, with photos) · `/late` · `/spent [YYYY-MM or name]` · `/owing` · `/status [name]` (everything you're expecting) · `/delivered [name]` (what has arrived) · `/undo` · `/healthcheck`
+`/pending [name]` (text list of everything not arrived, late or not) · `/pending_photos [name]` (same, with photos) · `/late` · `/spent [YYYY-MM or name]` · `/owing` · `/status [name]` (everything you're expecting) · `/delivered [name]` (arrived with the seller, not with you yet) · `/received [name]` (tick off what has reached you) · `/undo` · `/healthcheck`
 Or ask in plain words: "how much have I spent on ateez this month?"
 
-`/status` and `/delivered` list your batches with a tappable `#serial` button under each. Tap one and the bot sends that post's photos, with each item marked ⏳ waiting or ✅ arrived. "Arrived" means she has confirmed the cards reached her; the bot doesn't yet track mailing to you.
+`/status` and `/delivered` list your batches with a tappable `#serial` button under each. Tap one and the bot sends that post's photos, with each item marked ⏳ waiting or ✅ arrived. Each item goes through three stages: ⏳ ordered → ✅ arrived with the seller (her update) → 📬 received by you. When she confirms arrivals, run `/received`, tap the items that have reached you, and press Confirm.
 
 Every Sunday at 10:00 SGT it sends one text message listing everything still incoming, oldest first, with batches past 4 weeks flagged ⚠️. No photos, so it stays short; use `/pending_photos` when you want the pictures. Change the day/time with `DIGEST_DAY` / `DIGEST_HOUR` in `.env`.
 
