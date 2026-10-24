@@ -99,6 +99,23 @@ def dup_message(dup, tz: ZoneInfo) -> str:
             f"{how}. Confirm to process it again, or Cancel.")
 
 
+def relink_orders(store: Store) -> int:
+    """Link orders saved before their channel post was forwarded, when exactly one post clearly matches.
+    Needs a close title match (>= 0.85) that beats the runner-up, so similar versions are never mixed up."""
+    posts = store.recent_posts(500)
+    n = 0
+    for o in store.all("SELECT id, title FROM orders WHERE post_id IS NULL"):
+        scored = sorted(((sim(o["title"], p["title"]), p) for p in posts), key=lambda t: -t[0])
+        if not scored or scored[0][0] < 0.85:
+            continue
+        if len(scored) > 1 and scored[1][0] > scored[0][0] - 0.02:
+            continue  # ambiguous between two similar posts: leave it for the user
+        store.run("UPDATE orders SET post_id=? WHERE id=?", (scored[0][1]["id"], o["id"]))
+        store.run("UPDATE items SET post_id=? WHERE order_id=?", (scored[0][1]["id"], o["id"]))
+        n += 1
+    return n
+
+
 def post_candidates(store: Store, title: str, n: int = 5) -> list[dict]:
     scored = sorted(((sim(title, p["title"]), p) for p in store.recent_posts(200)),
                     key=lambda t: t[0], reverse=True)
@@ -194,6 +211,7 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
             tags = fallback_tags(ctx.get("raw_text"))
         tags = list(dict.fromkeys(tags))
         names = [n for n in parsed.get("names") or [] if n]
+        relinked = relink_orders(store)
         pending = store.items_pending()
         chosen, mine, quantities, warnings = [], [], {}, []
         for tag in tags:
@@ -227,7 +245,9 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                         "You may have forwarded this before. Nothing to do."}
             return {"kind": "unreadable", "reason": "Arrival notice read, but none of its hashtags match your pending items."
                     + ("".join(f"\n⚠️ {w}" for w in warnings))}
-        return {"kind": "arrival", "tags": mine, "names": names, "note": parsed.get("note"),
+        note = " ".join(x for x in [parsed.get("note"),
+                                    f"(Linked {relinked} earlier order(s) to their posts.)" if relinked else None] if x) or None
+        return {"kind": "arrival", "tags": mine, "names": names, "note": note,
                 "quantities": quantities, "item_ids": [r["id"] for r in chosen],
                 "items": [f"{r['name']} ×{r['qty']}" + (f" (#{r['tag']})" if r["tag"] else "") for r in chosen],
                 "arrived_at": msg_dt.isoformat(), "warnings": warnings}
@@ -317,6 +337,9 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
                                          d.get("media_group_id"), d.get("raw_text"), d.get("posted_at"))
         result = {"type": "post", "post_id": pid, "created": created}
         text = f"✅ Saved #{d['tag']}: {d['title']}"
+        linked = relink_orders(store)
+        if linked:
+            text += f"\nLinked {linked} earlier order(s) to it."
     elif k == "order":
         oid, item_ids = store.add_order(d.get("post_id"), d["title"], d["total_due"], d.get("mailing_fee"),
                                         d.get("note"), d["ordered_at"], d.get("raw_text"), d["items"])
@@ -605,8 +628,10 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         if not rows:
             return [{"text": "🎉 Nothing late." if intent == "late" else "🎉 Nothing pending."}]
         return cap_messages(pending_messages(store, cfg, now, rows))
-    return [{"text": "I can answer questions about spending, pending items, late items and what you owe. "
-                     "Try /spent, /pending, /late or /owing."}]
+    return [{"text": "To mark items as arrived, forward me the seller's arrival update and tap Confirm. "
+                     "When they reach you, use /received.\n\n"
+                     "Other commands: /status, /delivered, /pending, /late, /spent, /owing, /undo, /healthcheck. "
+                     "Or ask about spending, pending or late items in plain words."}]
 
 
 def cap_messages(msgs: list[dict]) -> list[dict]:

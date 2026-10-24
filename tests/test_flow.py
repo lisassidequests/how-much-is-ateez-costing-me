@@ -415,6 +415,34 @@ def test_old_inbox_gets_fingerprint_column(tmp_path):
     assert "fingerprint" in [r["name"] for r in Store(path).all("PRAGMA table_info(inbox)")]
 
 
+def test_orders_saved_before_their_post_get_linked_and_case_is_ignored(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    title = "ATEEZ GOLDEN HOUR PT.5 HELLOLIVE DIGIPACK FANSIGN 1.0 CHICK TEEZ VER."
+    confirm(store, ingest(store, FakeParser(dict(ORDER_DEJAVU, title=title)), cfg, text="order", when=now), cfg)
+    assert store.one("SELECT post_id FROM orders")["post_id"] is None          # post not forwarded yet
+    post = {"kind": "channel_post", "summary": "p", "tag": "ANATZ56", "title": title}
+    msg = confirm(store, ingest(store, FakeParser(post), cfg, text="#ANATZ56 ...", photo="P", channel=True), cfg)
+    assert "Linked 1 earlier order" in msg and store.get_post_by_tag("anatz56") is not None
+    arr = {"kind": "arrival_update", "summary": "x", "tags": ["ANATZ56"], "names": [],
+           "arrivals": [{"tag": "ANATZ56", "quantity": "x1 OT8"}]}
+    out = ingest(store, FakeParser(arr), cfg, text="#ANATZ56 (quantity: x1 OT8)")
+    assert out["draft"]["kind"] == "arrival" and len(out["draft"]["item_ids"]) == 2   # uppercase serial matched
+    assert store.find_post_by_tag("AnAtZ56")["tag"] == "anatz56"
+
+
+def test_arrival_links_orders_even_if_post_was_saved_first(env):
+    cfg, store = env
+    title = "ATEEZ GOLDEN HOUR PT.5 HELLOLIVE DIGIPACK FANSIGN 1.0 CHICK TEEZ VER."
+    store.upsert_post("anatz56", title, None, [], None, None, None)
+    # an order that went in unlinked (e.g. the match was missed at the time)
+    store.add_order(None, title, 15.5, None, None, datetime.now(TZ).isoformat(), "x",
+                    [{"name": "MINGI", "qty": 1, "line_total": 15.5}])
+    arr = {"kind": "arrival_update", "summary": "x", "tags": ["ANATZ56"], "names": []}
+    out = ingest(store, FakeParser(arr), cfg, text="#ANATZ56 arrived")
+    assert out["draft"]["kind"] == "arrival" and "Linked 1 earlier order" in out["draft"]["note"]
+
+
 def test_fallback_tag():
     assert fallback_tag("[po] #anghp6_4 ateez golden hour") == "anghp6_4"
     assert fallback_tag("no tag here, just #hello") is None
