@@ -11,6 +11,8 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 | Your payment screenshot | Logs the payment and links it to the order with the matching balance |
 | Seller's "arrived" update | Marks the items arrived (by `#serial`, and member names if given) |
 
+**Duplicate check:** if you forward the exact same message twice, or an order or payment that matches one you already saved (same product, items and total / same amount on the same day), the confirmation carries a ⚠️ "Possible duplicate" line. Tap Confirm to save it anyway (for a genuine repeat purchase) or Cancel. If an arrival notice only covers items already marked arrived, the bot just tells you so.
+
 ## Commands
 `/pending [name]` (text list of everything not arrived, late or not) · `/pending_photos [name]` (same, with photos) · `/late` · `/spent [YYYY-MM or name]` · `/owing` · `/status [name]` (everything you're expecting) · `/delivered [name]` (arrived with the seller, not with you yet) · `/received [name]` (tick off what has reached you) · `/undo` · `/healthcheck`
 Or ask in plain words: "how much have I spent on ateez this month?"

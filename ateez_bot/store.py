@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS inbox (
   photo_file_id TEXT,
   media_group_id TEXT,
   forwarded_from_channel INTEGER NOT NULL DEFAULT 0,
+  fingerprint TEXT,
   msg_date TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',   -- queued | done | failed
   error TEXT,
@@ -91,8 +92,9 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
         # migration for databases created before the "received" step existed
-        if "received_at" not in {r["name"] for r in self.all("PRAGMA table_info(items)")}:
-            self.db.execute("ALTER TABLE items ADD COLUMN received_at TEXT")
+        for table, column in (("items", "received_at"), ("inbox", "fingerprint")):
+            if column not in {r["name"] for r in self.all(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
         self.db.commit()
 
     # -- helpers -----------------------------------------------------------
@@ -172,13 +174,20 @@ class Store:
 
     # -- inbox -------------------------------------------------------------
     def inbox_add(self, chat_id, message_id, text, photo_file_id, media_group_id,
-                  forwarded_from_channel, msg_date) -> int:
+                  forwarded_from_channel, msg_date, fingerprint=None) -> int:
         return self.run(
             "INSERT INTO inbox(chat_id,message_id,text,photo_file_id,media_group_id,"
-            "forwarded_from_channel,msg_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            "forwarded_from_channel,msg_date,fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
             (chat_id, message_id, text, photo_file_id, media_group_id,
-             int(forwarded_from_channel), msg_date, now_iso()),
+             int(forwarded_from_channel), msg_date, fingerprint, now_iso()),
         )
+
+    def find_duplicate_forward(self, fingerprint: str, inbox_id: int):
+        """An earlier message with the same fingerprint that produced a draft, and what happened to that draft."""
+        return self.one(
+            "SELECT i.id, i.created_at, d.status AS draft_status FROM inbox i "
+            "JOIN drafts d ON d.inbox_id=i.id WHERE i.fingerprint=? AND i.id<? ORDER BY i.id DESC LIMIT 1",
+            (fingerprint, inbox_id))
 
     def inbox_get(self, inbox_id: int):
         return self.one("SELECT * FROM inbox WHERE id=?", (inbox_id,))

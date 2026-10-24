@@ -71,6 +71,34 @@ def clock_start(row, tz: ZoneInfo) -> datetime:
     return to_dt(row["first_paid"] or row["ordered_at"], tz)
 
 
+def find_duplicate_order(store: Store, title: str, total: float, items: list[dict]):
+    """A saved order with the same product, items and total (could be a re-forward or a genuine repeat)."""
+    names = sorted(" ".join(_tokens(i["name"])) for i in items)
+    for o in store.orders_with_balance():
+        if abs(o["total_due"] - total) > TOL or sim(title, o["title"]) < 0.9:
+            continue
+        saved = sorted(" ".join(_tokens(r["name"])) for r in store.all("SELECT name FROM items WHERE order_id=?", (o["id"],)))
+        if saved == names:
+            return o
+    return None
+
+
+def find_duplicate_payment(store: Store, amount: float, paid_at: str, tz: ZoneInfo):
+    day = to_dt(paid_at, tz).astimezone(tz).date()
+    for p in store.all("SELECT * FROM payments"):
+        if abs(p["amount"] - amount) <= TOL and to_dt(p["paid_at"], tz).astimezone(tz).date() == day:
+            return p
+    return None
+
+
+def dup_message(dup, tz: ZoneInfo) -> str:
+    how = {"confirmed": "and saved it", "cancelled": "but cancelled it",
+           "pending": "and it's still waiting for your confirmation", "undone": "saved it, then undid it"
+           }.get(dup["draft_status"], "")
+    return (f"Possible duplicate: you already forwarded this exact message on {fmt_date(dup['created_at'], tz)} "
+            f"{how}. Confirm to process it again, or Cancel.")
+
+
 def post_candidates(store: Store, title: str, n: int = 5) -> list[dict]:
     scored = sorted(((sim(title, p["title"]), p) for p in store.recent_posts(200)),
                     key=lambda t: t[0], reverse=True)
@@ -89,10 +117,13 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
             return {"kind": "unreadable", "reason": "This looks like a channel post but I couldn't find its #serial."}
         title = parsed.get("title") or (ctx.get("raw_text") or "").split("\n")[0][:120] or tag
         fid = ctx.get("image_file_id")
+        exists = store.get_post_by_tag(tag) is not None
         return {"kind": "channel_post", "tag": tag, "title": title, "price_note": parsed.get("price_note"),
                 "image_file_ids": [fid] if fid else [], "media_group_id": ctx.get("media_group_id"),
                 "raw_text": ctx.get("raw_text"), "posted_at": msg_dt.isoformat(),
-                "exists": store.get_post_by_tag(tag) is not None}
+                "exists": exists,
+                "warnings": ([f"Possible duplicate: #{tag} is already saved. Confirm to update it, or Cancel."]
+                             if exists else [])}
 
     if kind == "order_confirmation":
         items = [{"name": clean_name(i["name"]), "qty": int(i.get("qty") or 1),
@@ -107,6 +138,10 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
         warnings = []
         if abs(item_sum - total) > TOL:
             warnings.append(f"Items add up to {item_sum:.2f} but the total says {total:.2f}. Check before confirming.")
+        dup = find_duplicate_order(store, title, total, items)
+        if dup:
+            warnings.insert(0, f"Possible duplicate: this looks like order {dup['id']} ({fmt_date(dup['ordered_at'], tz)}), "
+                               "same product, items and total. Confirm to save it again, or Cancel.")
         post_id = post_tag = None
         mt = (parsed.get("matched_tag") or "").lstrip("#").lower()
         post = store.find_post_by_tag(mt) if mt and parsed.get("match_confidence") != "low" else None
@@ -136,8 +171,12 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
         if order_id is None:
             warnings.append("No single unpaid order matches this amount exactly. Pick the right one, or confirm to save it unlinked."
                             if cands else "No unpaid order found; this will be saved unlinked.")
+        paid_at = to_dt(parsed.get("paid_at"), tz, msg_dt).isoformat()
+        if find_duplicate_payment(store, amount, paid_at, tz):
+            warnings.insert(0, f"Possible duplicate: you already logged a payment of {amount:.2f} on "
+                               f"{fmt_date(paid_at, tz)}. Confirm to log it again, or Cancel.")
         return {"kind": "payment", "amount": amount,
-                "paid_at": to_dt(parsed.get("paid_at"), tz, msg_dt).isoformat(),
+                "paid_at": paid_at,
                 "reference": parsed.get("reference"), "order_id": order_id,
                 "candidates": cands, "warnings": warnings}
 
@@ -180,6 +219,12 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
             chosen = [r for r in pending if name_match(names, r["name"])]
             warnings.append("No #serial in the message, so I matched by item names only.")
         if not chosen:
+            canon = {(store.find_post_by_tag(t) or {"tag": t})["tag"] for t in tags}
+            done = [r for r in store.items_arrived() if r["tag"] in canon]
+            if done:
+                return {"kind": "unreadable", "reason": "Already recorded: your items under these hashtags were marked "
+                        f"arrived on {fmt_date(max(r['arrived_at'] for r in done), tz)}. "
+                        "You may have forwarded this before. Nothing to do."}
             return {"kind": "unreadable", "reason": "Arrival notice read, but none of its hashtags match your pending items."
                     + ("".join(f"\n⚠️ {w}" for w in warnings))}
         return {"kind": "arrival", "tags": mine, "names": names, "note": parsed.get("note"),
@@ -206,8 +251,7 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
         return "\n".join(lines)
     if k == "channel_post":
         extra = f"\n{d['price_note']}" if d.get("price_note") else ""
-        status = "\n(already saved; this will update it)" if d.get("exists") else ""
-        return f"📌 Channel post #{d['tag']}\n{d['title']}{extra}{status}"
+        return f"📌 Channel post #{d['tag']}\n{d['title']}{extra}{warn}"
     if k == "order":
         lines = "\n".join(f"• {i['name']} ×{i['qty']} — {money(i['line_total'], cur)}" for i in d["items"])
         link = (f"🔗 Linked to #{d['post_tag']}" if d.get("post_id")
@@ -605,6 +649,10 @@ async def run_inbox_item(store: Store, parser, cfg: Config, row, get_image) -> d
         store.inbox_set(row["id"], "done")
         if draft["kind"] == "unreadable":
             return {"type": "info", "text": "❓ " + draft["reason"]}
+        dup = store.find_duplicate_forward(row["fingerprint"], row["id"]) if row["fingerprint"] else None
+        if dup:  # an exact re-forward: say so once, instead of also repeating the content-based warning
+            draft["warnings"] = [w for w in draft.get("warnings", []) if not w.startswith("Possible duplicate")]
+            draft["warnings"].insert(0, dup_message(dup, cfg.tz))
         draft_id = store.draft_add(draft["kind"], draft, row["id"])
         return {"type": "draft", "draft_id": draft_id, "draft": draft}
     except AIUnavailable as exc:

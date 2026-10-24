@@ -350,6 +350,71 @@ def test_old_database_gets_received_column(tmp_path):
     assert "received_at" in [r["name"] for r in store.all("PRAGMA table_info(items)")]
 
 
+def send_with_fingerprint(store, cfg, parsed, text, when, fp):
+    iid = store.inbox_add(1, 1, text, None, None, False, when.isoformat(), fp)
+    return asyncio.run(pl.run_inbox_item(store, FakeParser(parsed), cfg, store.inbox_get(iid), fake_image))
+
+
+def test_exact_reforward_is_flagged_once(env):
+    cfg, store = env
+    when = datetime.now(TZ)
+    first = send_with_fingerprint(store, cfg, ORDER_DEJAVU, "order text", when, "fp1")
+    assert first["draft"]["warnings"] == []
+    confirm(store, first, cfg)
+    second = send_with_fingerprint(store, cfg, ORDER_DEJAVU, "order text", when, "fp1")
+    w = second["draft"]["warnings"]
+    assert len(w) == 1 and "already forwarded this exact message" in w[0] and "saved it" in w[0]
+    # still just a draft: the user decides
+    assert second["type"] == "draft" and len(store.all("SELECT id FROM orders")) == 1
+
+
+def test_same_order_sent_as_new_message_is_flagged(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    confirm(store, ingest(store, FakeParser(ORDER_DEJAVU), cfg, text="order", when=now), cfg)
+    again = ingest(store, FakeParser(ORDER_DEJAVU), cfg, text="order again", when=now + timedelta(hours=1))
+    assert "this looks like order 1" in again["draft"]["warnings"][0]
+    other = ingest(store, FakeParser(ORDER_P5), cfg, text="a different order", when=now)
+    assert other["draft"]["warnings"] == []
+
+
+def test_duplicate_payment_and_post_are_flagged(env):
+    cfg, store = env
+    pay = {"kind": "payment_proof", "summary": "x", "amount": 15.5, "paid_at": "2026-10-01T10:00:00+08:00"}
+    confirm(store, ingest(store, FakeParser(pay), cfg, photo="S1"), cfg)
+    again = ingest(store, FakeParser(dict(pay, paid_at="2026-10-01T18:30:00+08:00")), cfg, photo="S2")
+    assert "already logged a payment of 15.50" in again["draft"]["warnings"][0]
+    other_day = ingest(store, FakeParser(dict(pay, paid_at="2026-10-02T10:00:00+08:00")), cfg, photo="S3")
+    assert other_day["draft"]["warnings"] == [] or "already logged" not in other_day["draft"]["warnings"][0]
+
+    confirm(store, ingest(store, FakeParser(POST_P5), cfg, text="#anghp5_2 x", photo="P", channel=True), cfg)
+    post_again = ingest(store, FakeParser(POST_P5), cfg, text="#anghp5_2 x", photo="P", channel=True)
+    assert "#anghp5_2 is already saved" in post_again["draft"]["warnings"][0]
+    assert "Possible duplicate" in pl.render_draft(post_again["draft"], "S$", TZ)
+
+
+def test_arrival_already_recorded_says_so(env):
+    cfg, store = env
+    setup_orders(store, cfg, datetime.now(TZ))
+    arr = {"kind": "arrival_update", "summary": "x", "tags": ["anghp5_2"], "names": []}
+    confirm(store, ingest(store, FakeParser(arr), cfg, text="#anghp5_2 arrived"), cfg)
+    again = ingest(store, FakeParser(arr), cfg, text="#anghp5_2 arrived")
+    assert again["type"] == "info" and "Already recorded" in again["text"]
+
+
+def test_old_inbox_gets_fingerprint_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old2.db")
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE inbox (id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, "
+                "text TEXT, photo_file_id TEXT, media_group_id TEXT, forwarded_from_channel INTEGER NOT NULL "
+                "DEFAULT 0, msg_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', error TEXT, "
+                "created_at TEXT NOT NULL)")
+    con.commit()
+    con.close()
+    assert "fingerprint" in [r["name"] for r in Store(path).all("PRAGMA table_info(inbox)")]
+
+
 def test_fallback_tag():
     assert fallback_tag("[po] #anghp6_4 ateez golden hour") == "anghp6_4"
     assert fallback_tag("no tag here, just #hello") is None

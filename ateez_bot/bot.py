@@ -1,6 +1,7 @@
 """Telegram layer: thin handlers around pipeline.py, plus scheduled jobs."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -222,9 +223,14 @@ class BotApp:
             return
         origin = msg.forward_origin
         when = origin.date if origin is not None else msg.date
+        fingerprint = None
+        if origin is not None:  # same original message forwarded twice => same text, origin time and photo
+            unique = (msg.photo[-1].file_unique_id if msg.photo
+                      else msg.document.file_unique_id if msg.document else "")
+            fingerprint = hashlib.sha256(f"{text or ''}|{when.isoformat()}|{unique}".encode()).hexdigest()[:20]
         inbox_id = self.store.inbox_add(
             msg.chat_id, msg.message_id, text, file_id, msg.media_group_id,
-            origin is not None and origin.type == "channel", when.isoformat())
+            origin is not None and origin.type == "channel", when.isoformat(), fingerprint)
         await self.process(inbox_id)
 
     async def on_callback(self, update: Update, ctx):
