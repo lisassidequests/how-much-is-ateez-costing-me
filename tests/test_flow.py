@@ -282,6 +282,29 @@ def test_hyphenated_serials_match_either_way(env):
     assert fallback_tags("#ANATZ38-2 (quantity: x4 pcs) #anghp5_2") == ["anatz38-2", "anghp5_2"]
 
 
+def test_status_and_delivered_overviews_have_photo_buttons(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    setup_orders(store, cfg, now)
+    msgs = pl.answer_question(store, cfg, {"intent": "status"}, now)
+    assert len(msgs) == 1 and "Expecting 4 item(s) in 2 batch(es)" in msgs[0]["text"]
+    labels = [b[0] for row in msgs[0]["buttons"] for b in row]
+    assert labels == ["#anghp5_2"]                       # the unlinked batch has no # to tap
+    post_id = store.get_post_by_tag("anghp5_2")["id"]
+    assert msgs[0]["buttons"][0][0][1] == f"t:{post_id}"
+    assert pl.answer_question(store, cfg, {"intent": "delivered"}, now)[0]["text"] == "Nothing has arrived yet."
+
+    arr = {"kind": "arrival_update", "summary": "x", "tags": ["anghp5_2"], "names": []}
+    confirm(store, ingest(store, FakeParser(arr), cfg, text="#anghp5_2 arrived"), cfg)
+    delivered = pl.answer_question(store, cfg, {"intent": "delivered"}, now)[0]
+    assert "Arrived: 2 item(s) in 1 batch(es)" in delivered["text"]
+    assert delivered["buttons"][0][0][0] == "#anghp5_2"
+    status = pl.answer_question(store, cfg, {"intent": "status"}, now)[0]
+    assert "2 item(s) in 1 batch(es)" in status["text"] and status["buttons"] is None
+    cap = pl.batch_caption(store, cfg, post_id, now)
+    assert "✅ OT8 INDIVIDUAL ×8" in cap and cap.startswith("#anghp5_2")
+
+
 def test_fallback_tag():
     assert fallback_tag("[po] #anghp6_4 ateez golden hour") == "anghp6_4"
     assert fallback_tag("no tag here, just #hello") is None

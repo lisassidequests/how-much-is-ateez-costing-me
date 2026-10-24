@@ -252,6 +252,19 @@ class Store:
             "WHERE i.arrived_at IS NULL ORDER BY o.ordered_at"
         )
 
+    def items_arrived(self):
+        return self.all(
+            "SELECT i.*, o.title AS order_title, o.ordered_at, p.tag, p.title AS post_title, "
+            "p.image_file_ids "
+            "FROM items i JOIN orders o ON o.id=i.order_id LEFT JOIN posts p ON p.id=i.post_id "
+            "WHERE i.arrived_at IS NOT NULL ORDER BY i.arrived_at DESC"
+        )
+
+    def items_for_post(self, post_id: int):
+        return self.all(
+            "SELECT i.*, o.ordered_at, (SELECT MIN(paid_at) FROM payments WHERE order_id=o.id) AS first_paid "
+            "FROM items i JOIN orders o ON o.id=i.order_id WHERE i.post_id=? ORDER BY i.id", (post_id,))
+
     def all_payments(self):
         return self.all(
             "SELECT pay.*, o.title AS order_title, p.tag, p.title AS post_title, "

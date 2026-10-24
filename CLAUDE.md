@@ -18,6 +18,7 @@ Single user. Python 3.10+, SQLite, python-telegram-bot (long polling), Anthropic
 - Proactive reminder is a single text-only weekly digest (Sunday 10:00 SGT) of everything still incoming, late batches flagged. No daily alerts, no photos (photos only via /pending_photos; /pending is the same text list on demand). `items.last_alert_at` is now unused.
 - "OT8" = one piece of each of the 8 members (8 pieces total); "OT4" = 4 pieces. Item qty is in pieces, and the seller's "X1" count prefix is stripped from item names.
 - The seller's mass "[ARRIVAL PROOF]" posts list many hashtags with quantities ("#anghp5_2 (quantity: x4 unit pcs)"), most belonging to other buyers. Only tags with the user's pending items are used; others are ignored silently. Serials can contain hyphens (`#ANATZ38-2`; Telegram only highlights up to the hyphen), so lookups tolerate `-`/`_` differences. Quantities are shown in the confirmation but do not yet drive partial arrivals.
+- Commands: /status = expecting overview, /delivered = arrived overview (both with `#tag` inline buttons -> callback `t:<post_id>` sends the post's photos); /healthcheck = bot health (formerly /status). "Arrived" = arrived with the seller, not received by the user.
 - Payments are separate rows (partial/second payments exist). Spend = sum of payments.
 - If Claude is unavailable (no credits, bad key, outage) messages stay `queued` in `inbox` and are retried automatically; the user is told once per 6 hours.
 - Only `ALLOWED_USER_ID` may use the bot.

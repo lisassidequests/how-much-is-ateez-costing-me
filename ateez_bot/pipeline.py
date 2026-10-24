@@ -372,6 +372,69 @@ def weekly_digest(store: Store, cfg: Config, now: datetime, keyword: str | None 
     return chunks
 
 
+BATCHES_PER_MESSAGE = 12
+
+
+def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str | None = None) -> list[dict]:
+    """mode 'expecting' = not arrived yet, 'delivered' = arrived. One message per batch group, each batch has a
+    tappable #serial button (callback t:<post_id>) that sends that post's photos."""
+    rows = store.items_pending() if mode == "expecting" else store.items_arrived()
+    rows = [r for r in rows if keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
+    if not rows:
+        return []
+    batches: dict[str, dict] = {}
+    for r in rows:
+        b = batches.setdefault(r["tag"] or f"order-{r['order_id']}", {
+            "tag": r["tag"], "post_id": r["post_id"], "names": [], "age": 0, "arrived": "",
+            "head": f"#{r['tag']} {r['post_title']}" if r["tag"] else f"{r['order_title']} (no post linked)"})
+        b["names"].append(r["name"] if r["qty"] == 1 else f"{r['name']} ×{r['qty']}")
+        if mode == "expecting":
+            b["age"] = max(b["age"], (now - clock_start(r, cfg.tz)).days)
+        else:
+            b["arrived"] = max(b["arrived"], r["arrived_at"])
+    ordered = sorted(batches.values(), key=(lambda b: -b["age"]) if mode == "expecting"
+                     else (lambda b: b["arrived"]), reverse=(mode != "expecting"))
+    n_items = len(rows)
+    if mode == "expecting":
+        late = sum(1 for b in ordered if b["age"] >= cfg.late_days)
+        header = f"📦 Expecting {n_items} item(s) in {len(ordered)} batch(es)"
+        if late:
+            header += f"\n⚠️ {late} batch(es) past {cfg.late_days // 7} weeks. Maybe ask the seller?"
+    else:
+        header = (f"✅ Arrived: {n_items} item(s) in {len(ordered)} batch(es). "
+                  "These have reached the seller; mailing to you is separate.")
+    msgs = []
+    for i in range(0, len(ordered), BATCHES_PER_MESSAGE):
+        chunk = ordered[i:i + BATCHES_PER_MESSAGE]
+        lines = [header if i == 0 else "(continued)"]
+        for b in chunk:
+            if mode == "expecting":
+                lines.append(f"{'⚠️' if b['age'] >= cfg.late_days else '⏳'} {b['head']}: {', '.join(b['names'])} ({b['age']}d)")
+            else:
+                lines.append(f"✅ {b['head']}: {', '.join(b['names'])} (arrived {fmt_date(b['arrived'], cfg.tz)})")
+        buttons = [(f"#{b['tag']}", f"t:{b['post_id']}") for b in chunk if b["post_id"]]
+        if buttons:
+            lines.append("\nTap a # below to see the photos.")
+        msgs.append({"text": "\n".join(lines),
+                     "buttons": [buttons[j:j + 3] for j in range(0, len(buttons), 3)] or None})
+    return msgs
+
+
+def batch_caption(store: Store, cfg: Config, post_id: int, now: datetime) -> str:
+    """Caption for the photos of one post: every item you ordered under it, with status."""
+    post = store.get_post(post_id)
+    lines = [f"#{post['tag']} {post['title']}"]
+    items = store.items_for_post(post_id)
+    if not items:
+        lines.append("(no orders saved against this post yet)")
+    for r in items:
+        if r["arrived_at"]:
+            lines.append(f"✅ {r['name']} ×{r['qty']}: arrived {fmt_date(r['arrived_at'], cfg.tz)}")
+        else:
+            lines.append(f"⏳ {r['name']} ×{r['qty']}: {(now - clock_start(r, cfg.tz)).days}d waiting")
+    return "\n".join(lines)[:1000]
+
+
 def spent_text(store: Store, cfg: Config, month: str | None, keyword: str | None) -> str:
     cur = cfg.currency
     pays = [p for p in store.all_payments()
@@ -416,6 +479,10 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return [{"text": spent_text(store, cfg, month, kw)}]
     if intent == "owing":
         return [{"text": owing_text(store, cfg, kw)}]
+    if intent in ("status", "delivered"):
+        mode = "expecting" if intent == "status" else "delivered"
+        return overview(store, cfg, now, mode, kw) or [{"text": "🎉 Nothing pending." if intent == "status"
+                                                         else "Nothing has arrived yet."}]
     if intent == "pending":  # compact text list of everything not arrived, late or not
         chunks = weekly_digest(store, cfg, now, kw)
         return [{"text": c} for c in chunks] or [{"text": "🎉 Nothing pending."}]
@@ -436,7 +503,7 @@ def cap_messages(msgs: list[dict]) -> list[dict]:
     return msgs[:MAX_GROUPS] + [{"text": f"…and {len(msgs) - MAX_GROUPS} more batches. Narrow it down, e.g. /pending_photos ateez."}]
 
 
-def status_text(store: Store, cfg: Config) -> str:
+def health_text(store: Store, cfg: Config) -> str:
     q = len(store.inbox_queued())
     counts = {t: store.one(f"SELECT COUNT(*) c FROM {t}")["c"] for t in ("posts", "orders", "items", "payments")}
     return (f"🟢 Bot running. Saved: {counts['posts']} posts, {counts['orders']} orders, "

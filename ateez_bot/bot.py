@@ -1,12 +1,13 @@
 """Telegram layer: thin handlers around pipeline.py, plus scheduled jobs."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, time, timedelta
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
@@ -31,7 +32,9 @@ HELP = (
     "/spent [YYYY-MM or name]: how much you've spent\n"
     "/owing: unpaid or part-paid orders\n"
     "/undo: reverse the last thing you confirmed\n"
-    "/status: health check\n"
+    "/status [name]: everything you're still expecting, with a button per # for the photos\n"
+    "/delivered [name]: what has arrived, with the same # photo buttons\n"
+    "/healthcheck: is the bot running OK?\n"
     "You can also just ask, e.g. \"how much have I spent on ateez this month?\""
 )
 
@@ -73,7 +76,8 @@ class BotApp:
                     continue
                 except BadRequest:
                     log.warning("Photo send failed, falling back to text")
-            await self.send(chat_id, m["text"])
+            kw = {"reply_markup": markup(m["buttons"])} if m.get("buttons") else {}
+            await self.send(chat_id, m["text"], **kw)
 
     def _rate_limited_alert_due(self, key: str, hours: float) -> bool:
         last = self.store.get_setting(key)
@@ -154,12 +158,41 @@ class BotApp:
         if self.authorized(update):
             await update.effective_message.reply_text(pl.undo_last(self.store))
 
-    async def cmd_status(self, update: Update, ctx):
+    async def cmd_healthcheck(self, update: Update, ctx):
         if self.authorized(update):
             extra = "\n⚠️ Claude is currently unavailable." if self.store.get_setting("ai_down") == "1" else ""
             failed = self.store.one("SELECT COUNT(*) c FROM inbox WHERE status='failed'")["c"]
             extra += f"\nMessages that failed to process: {failed}" if failed else ""
-            await update.effective_message.reply_text(pl.status_text(self.store, self.cfg) + extra)
+            await update.effective_message.reply_text(pl.health_text(self.store, self.cfg) + extra)
+
+    async def cmd_status(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "status", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_delivered(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "delivered", "keyword": " ".join(ctx.args) or None})
+
+    async def send_batch(self, chat_id: int, post_id: int) -> None:
+        """Photos of one post (what you ordered), with item statuses as the caption."""
+        post = self.store.get_post(post_id)
+        if not post:
+            await self.send(chat_id, "I can't find that post any more.")
+            return
+        caption = pl.batch_caption(self.store, self.cfg, post_id, datetime.now(self.cfg.tz))
+        photos = json.loads(post["image_file_ids"])[:10]
+        try:
+            if len(photos) > 1:
+                await self.app.bot.send_media_group(chat_id=chat_id, media=[
+                    InputMediaPhoto(f, caption=caption if i == 0 else None) for i, f in enumerate(photos)])
+                return
+            if photos:
+                await self.app.bot.send_photo(chat_id=chat_id, photo=photos[0], caption=caption)
+                return
+        except BadRequest:
+            log.warning("Photo send failed for post %s, falling back to text", post_id)
+        await self.send(chat_id, caption + ("" if not photos else "\n(photo unavailable)")
+                        + ("\n(no photo saved for this post)" if not photos else ""))
 
     async def on_message(self, update: Update, ctx):
         if not self.authorized(update):
@@ -186,6 +219,9 @@ class BotApp:
         if not self.authorized(update):
             return
         action, *rest = q.data.split(":")
+        if action == "t":  # tapped a #serial button: send that batch's photos
+            await self.send_batch(q.message.chat_id, int(rest[0]))
+            return
         draft_id = int(rest[0])
         row = self.store.draft_get(draft_id)
         if not row or row["status"] != "pending":
@@ -259,11 +295,13 @@ class BotApp:
             await application.bot.set_my_commands([
                 ("pending", "What hasn't arrived yet (text list)"),
                 ("pending_photos", "What hasn't arrived yet, with photos"),
+                ("status", "Everything I'm still expecting (tap # for photos)"),
+                ("delivered", "What has arrived (tap # for photos)"),
                 ("late", "Items past the late threshold"),
                 ("spent", "How much I've spent"),
                 ("owing", "Unpaid or part-paid orders"),
                 ("undo", "Reverse the last confirmed item"),
-                ("status", "Bot health check"),
+                ("healthcheck", "Is the bot running OK?"),
                 ("help", "How to use this bot"),
             ])
 
@@ -272,7 +310,8 @@ class BotApp:
         for name, fn in [("start", self.cmd_start), ("help", self.cmd_help), ("pending", self.cmd_pending),
                          ("pending_photos", self.cmd_pending_photos),
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
-                         ("undo", self.cmd_undo), ("status", self.cmd_status)]:
+                         ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
+                         ("status", self.cmd_status), ("delivered", self.cmd_delivered)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(
