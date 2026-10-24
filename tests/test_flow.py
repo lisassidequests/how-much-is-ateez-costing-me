@@ -241,6 +241,14 @@ def test_classify_error_detects_credit_problem():
     assert classify_error(other) is None
 
 
+def test_item_names_drop_seller_count_prefix(env):
+    cfg, store = env
+    parsed = dict(ORDER_DEJAVU, items=[{"name": "X1 OT8", "qty": 8, "line_total": 15.5}])
+    out = ingest(store, FakeParser(parsed), cfg, text="order")
+    assert out["draft"]["items"][0]["name"] == "OT8"
+    assert pl.clean_name("x2 HONGJOONG") == "HONGJOONG" and pl.clean_name("OT4 UNIT") == "OT4 UNIT"
+
+
 def test_fallback_tag():
     assert fallback_tag("[po] #anghp6_4 ateez golden hour") == "anghp6_4"
     assert fallback_tag("no tag here, just #hello") is None

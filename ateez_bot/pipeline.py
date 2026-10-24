@@ -45,6 +45,11 @@ def fmt_date(iso: str | None, tz: ZoneInfo) -> str:
     return to_dt(iso, tz).astimezone(tz).strftime("%d %b %Y") if iso else "?"
 
 
+def clean_name(name: str) -> str:
+    """Drop the seller's leading count marker ("X1 OT8" -> "OT8"); quantity is stored separately."""
+    return re.sub(r"^\s*[xX×]\s*\d+\s+", "", name).strip() or name.strip()
+
+
 def name_match(names: list[str], item_name: str) -> bool:
     item = " ".join(_tokens(item_name))
     for n in names:
@@ -90,7 +95,8 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                 "exists": store.get_post_by_tag(tag) is not None}
 
     if kind == "order_confirmation":
-        items = [{"name": i["name"], "qty": int(i.get("qty") or 1), "line_total": float(i.get("line_total") or 0)}
+        items = [{"name": clean_name(i["name"]), "qty": int(i.get("qty") or 1),
+                  "line_total": float(i.get("line_total") or 0)}
                  for i in parsed.get("items") or []]
         item_sum = round(sum(i["line_total"] for i in items), 2)
         total = parsed.get("total_due")
