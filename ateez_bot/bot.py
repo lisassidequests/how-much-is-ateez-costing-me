@@ -33,7 +33,10 @@ HELP = (
     "/spent [YYYY-MM or name]: how much you've spent\n"
     "/owing: unpaid or part-paid orders\n"
     "/undo: reverse the last thing you confirmed\n"
-    "/status [name]: everything you're still expecting, with a button per # for the photos\n"
+    "/status [name]: everything you're still awaiting (not at the seller yet, or at the seller but not with you), "
+    "with a button per # for the photos\n"
+    "/all [name]: every order at a glance: paid or owing, and where each item is\n"
+    "/settle [order no.]: close an order whose total and payments don't match, treating what you paid as final\n"
     "/delivered [name]: arrived with the seller but not with you yet (# buttons too)\n"
     "/received [name]: tick off what has reached you\n"
     "/healthcheck: is the bot running OK?\n"
@@ -174,6 +177,26 @@ class BotApp:
     async def cmd_delivered(self, update: Update, ctx):
         if self.authorized(update):
             await self._reply_report(update, {"intent": "delivered", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_all(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "all", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_settle(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        arg = ctx.args[0].lstrip("#") if ctx.args else None
+        order_id = int(arg) if arg and arg.isdigit() else None
+        drafts = pl.settle_drafts(self.store, order_id)
+        if not drafts:
+            await update.effective_message.reply_text(
+                "Nothing to settle: every order's payments match its total." if order_id is None
+                else f"Order {order_id} doesn't exist or already matches its payments.")
+            return
+        for d in drafts:
+            draft_id = self.store.draft_add("settle", d)
+            await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                            reply_markup=markup(pl.draft_buttons(draft_id, d)))
 
     async def cmd_received(self, update: Update, ctx):
         if not self.authorized(update):
@@ -328,7 +351,9 @@ class BotApp:
             await application.bot.set_my_commands([
                 ("pending", "What hasn't arrived yet (text list)"),
                 ("pending_photos", "What hasn't arrived yet, with photos"),
-                ("status", "Everything I'm still expecting (tap # for photos)"),
+                ("status", "Everything I'm still awaiting (tap # for photos)"),
+                ("all", "Every order and its status at a glance"),
+                ("settle", "Close an order whose payments don't match its total"),
                 ("delivered", "Arrived with the seller, not yet with me"),
                 ("received", "Mark what has reached me"),
                 ("late", "Items past the late threshold"),
@@ -346,7 +371,7 @@ class BotApp:
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
                          ("status", self.cmd_status), ("delivered", self.cmd_delivered),
-                         ("received", self.cmd_received)]:
+                         ("received", self.cmd_received), ("all", self.cmd_all), ("settle", self.cmd_settle)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(

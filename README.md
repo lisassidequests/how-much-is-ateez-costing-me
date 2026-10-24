@@ -14,8 +14,10 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 **Duplicate check:** if you forward the exact same message twice, or an order or payment that matches one you already saved (same product, items and total / same amount on the same day), the confirmation carries a ⚠️ "Possible duplicate" line. Tap Confirm to save it anyway (for a genuine repeat purchase) or Cancel. If an arrival notice only covers items already marked arrived, the bot just tells you so.
 
 ## Commands
-`/pending [name]` (text list of everything not arrived, late or not) · `/pending_photos [name]` (same, with photos) · `/late` · `/spent [YYYY-MM or name]` · `/owing` · `/status [name]` (everything you're expecting) · `/delivered [name]` (arrived with the seller, not with you yet) · `/received [name]` (tick off what has reached you) · `/undo` · `/healthcheck`
+`/pending [name]` (text list of everything not arrived, late or not) · `/pending_photos [name]` (same, with photos) · `/late` · `/spent [YYYY-MM or name]` · `/owing` · `/status [name]` (everything you're still awaiting: not at the seller yet, or at the seller but not with you) · `/all [name]` (every order at a glance) · `/settle [order no.]` (close an order whose total and payments don't match) · `/delivered [name]` (arrived with the seller, not with you yet) · `/received [name]` (tick off what has reached you) · `/undo` · `/healthcheck`
 Or ask in plain words: "how much have I spent on ateez this month?"
+
+When an order's total, items and payments never tally (a part-payment, a seller's rounding), `/settle` shows each such order and, on Confirm, treats what you paid as the final total; `/undo` reverses it.
 
 `/status` and `/delivered` list your batches with a tappable `#serial` button under each. Tap one and the bot sends that post's photos, with each item marked ⏳ waiting or ✅ arrived. Each item goes through three stages: ⏳ ordered → ✅ arrived with the seller (her update) → 📬 received by you. When she confirms arrivals, run `/received`, tap the items that have reached you, and press Confirm.
 

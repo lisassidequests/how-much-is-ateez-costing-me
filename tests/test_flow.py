@@ -365,7 +365,7 @@ def test_status_and_delivered_overviews_have_photo_buttons(env):
     now = datetime.now(TZ)
     setup_orders(store, cfg, now)
     msgs = pl.answer_question(store, cfg, {"intent": "status"}, now)
-    assert len(msgs) == 1 and "Expecting 4 item(s) in 2 batch(es)" in msgs[0]["text"]
+    assert len(msgs) == 1 and "Awaiting 4 item(s)" in msgs[0]["text"] and "4 not at the seller yet" in msgs[0]["text"]
     labels = [b[0] for row in msgs[0]["buttons"] for b in row]
     assert labels == ["#anghp5_2"]                       # the unlinked batch has no # to tap
     post_id = store.get_post_by_tag("anghp5_2")["id"]
@@ -378,7 +378,9 @@ def test_status_and_delivered_overviews_have_photo_buttons(env):
     assert "2 item(s) in 1 batch(es)" in delivered["text"]
     assert delivered["buttons"][0][0][0] == "#anghp5_2"
     status = pl.answer_question(store, cfg, {"intent": "status"}, now)[0]
-    assert "2 item(s) in 1 batch(es)" in status["text"] and status["buttons"] is None
+    # still awaiting: 2 not at the seller + 2 at the seller but not with me
+    assert "Awaiting 4 item(s)" in status["text"] and "2 at the seller" in status["text"]
+    assert "📬" in status["text"] and "at seller since" in status["text"]
     cap = pl.batch_caption(store, cfg, post_id, now)
     assert "✅ OT8 INDIVIDUAL ×8" in cap and cap.startswith("#anghp5_2")
 
@@ -563,3 +565,29 @@ def test_bot_wires_up_offline(env):
     cfg, store = env
     app = BotApp(cfg, store, FakeParser()).build()
     assert app.job_queue is not None
+
+
+def test_all_overview_and_settle(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    setup_orders(store, cfg, now)
+    out = pl.answer_question(store, cfg, {"intent": "all"}, now)
+    assert len(out) == 1 and "order(s)" in out[0]["text"] and out[0]["text"].count("Order ") >= 2
+    assert "ordered" in out[0]["text"]
+    assert pl.settle_drafts(store) != [] or all(abs(o["total_due"] - o["paid"]) <= pl.TOL for o in store.orders_with_balance())
+
+    # a part-paid order: settle treats what was paid as the final total, and /undo restores it
+    oid = store.add_order(None, "MISMATCH ORDER", 54.5, None, None, now.isoformat(), "x",
+                          [{"name": "SAN", "qty": 1, "line_total": 54.5}])[0]
+    pid = store.add_payment(43.5, now.isoformat(), None)
+    store.add_allocation(pid, oid, 43.5)
+    ds = pl.settle_drafts(store, oid)
+    assert len(ds) == 1 and ds[0]["paid"] == 43.5 and ds[0]["total_due"] == 54.5
+    assert "you still owe" in pl.render_draft(ds[0], "S$", TZ)
+    did = store.draft_add("settle", ds[0])
+    assert "settled at" in pl.apply_draft(store, did, "S$", TZ)
+    assert pl.settle_drafts(store, oid) == []
+    assert "settled, was" in pl.answer_question(store, cfg, {"intent": "all"}, now)[0]["text"]
+    assert "Nothing owing" in pl.owing_text(store, cfg, "MISMATCH")
+    assert "Reopened order" in pl.undo_last(store)
+    assert len(pl.settle_drafts(store, oid)) == 1

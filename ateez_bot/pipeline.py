@@ -327,6 +327,13 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
             lines += [f"{'☑️' if it['id'] in sel else '☐'} {it['name']} ×{it['qty']} "
                       f"(arrived {fmt_date(it['arrived_at'], tz)})" for it in its]
         return "\n".join(lines)
+    if k == "settle":
+        diff = d["total_due"] - d["paid"]
+        what = (f"you still owe {money(diff, cur)}" if diff > 0 else f"you overpaid by {money(-diff, cur)}")
+        return (f"🤝 Settle Order {d['order_id']}: {d['title']}\n"
+                f"Listed total {money(d['total_due'], cur)}, you paid {money(d['paid'], cur)} ({what}).\n"
+                f"Confirm to treat {money(d['paid'], cur)} as the final total, so the order counts as fully paid. "
+                "/undo reverses it.")
     if k == "channel_post":
         extra = f"\n{d['price_note']}" if d.get("price_note") else ""
         return f"📌 Channel post #{d['tag']}\n{d['title']}{extra}{warn}"
@@ -433,6 +440,14 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
                 text += f"\n⚠️ {money(remainder, cur)} wasn't allocated to any order."
         else:
             text += " (not linked to an order)"
+    elif k == "settle":
+        o = store.one("SELECT total_due FROM orders WHERE id=?", (d["order_id"],))
+        if not o:
+            raise ValueError("That order no longer exists.")
+        paid = store.one("SELECT COALESCE(SUM(amount),0) s FROM allocations WHERE order_id=?", (d["order_id"],))["s"]
+        store.run("UPDATE orders SET settled_from=?, total_due=? WHERE id=?", (o["total_due"], paid, d["order_id"]))
+        result = {"type": "settle", "order_id": d["order_id"], "old_total": o["total_due"]}
+        text = f"✅ Order {d['order_id']} settled at {money(paid, cur)}."
     elif k == "arrival":
         fresh = [r["id"] for r in store.all(
             f"SELECT id FROM items WHERE arrived_at IS NULL AND id IN ({','.join('?' * len(d['item_ids']))})",
@@ -475,6 +490,9 @@ def undo_last(store: Store) -> str:
     elif r["type"] == "payment":
         store.run("DELETE FROM payments WHERE id=?", (r["payment_id"],))
         msg = "Removed the last payment."
+    elif r["type"] == "settle":
+        store.run("UPDATE orders SET total_due=?, settled_from=NULL WHERE id=?", (r["old_total"], r["order_id"]))
+        msg = f"Reopened order {r['order_id']} (total back to {r['old_total']:.2f})."
     elif r["type"] == "received":
         if r["item_ids"]:
             store.run(f"UPDATE items SET received_at=NULL WHERE id IN ({','.join('?' * len(r['item_ids']))})",
@@ -556,49 +574,108 @@ BATCHES_PER_MESSAGE = 12
 
 
 def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str | None = None) -> list[dict]:
-    """mode 'expecting' = not arrived yet, 'delivered' = arrived. One message per batch group, each batch has a
-    tappable #serial button (callback t:<post_id>) that sends that post's photos."""
-    rows = store.items_pending() if mode == "expecting" else store.items_arrived(unreceived_only=True)
-    rows = [r for r in rows if keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])]
-    if not rows:
+    """mode 'expecting' = everything you're still awaiting (not at the seller yet, or at the seller but not with you),
+    'delivered' = at the seller, not yet with you. One message per group of batches; each batch has a tappable
+    #serial button (callback t:<post_id>) that sends that post's photos."""
+    def ok(r):
+        return keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])
+    pending = [r for r in store.items_pending() if ok(r)] if mode == "expecting" else []
+    at_seller = [r for r in store.items_arrived(unreceived_only=True) if ok(r)]
+    if not pending and not at_seller:
         return []
-    batches: dict[str, dict] = {}
-    for r in rows:
-        b = batches.setdefault(r["tag"] or f"order-{r['order_id']}", {
-            "tag": r["tag"], "post_id": r["post_id"], "names": [], "age": 0, "arrived": "",
-            "head": f"#{r['tag']} {r['post_title']}" if r["tag"] else f"{r['order_title']} (no post linked)"})
-        b["names"].append(r["name"] if r["qty"] == 1 else f"{r['name']} ×{r['qty']}")
-        if mode == "expecting":
-            b["age"] = max(b["age"], (now - clock_start(r, cfg.tz)).days)
-        else:
-            b["arrived"] = max(b["arrived"], r["arrived_at"])
-    ordered = sorted(batches.values(), key=(lambda b: -b["age"]) if mode == "expecting"
-                     else (lambda b: b["arrived"]), reverse=(mode != "expecting"))
-    n_items = len(rows)
+    batches: dict[tuple, dict] = {}
+    for stage, rows in (("pending", pending), ("arrived", at_seller)):
+        for r in rows:
+            b = batches.setdefault((stage, r["tag"] or f"order-{r['order_id']}"), {
+                "stage": stage, "tag": r["tag"], "post_id": r["post_id"], "names": [], "age": 0, "arrived": "",
+                "head": f"#{r['tag']} {r['post_title']}" if r["tag"] else f"{r['order_title']} (no post linked)"})
+            b["names"].append(r["name"] if r["qty"] == 1 else f"{r['name']} ×{r['qty']}")
+            if stage == "pending":
+                b["age"] = max(b["age"], (now - clock_start(r, cfg.tz)).days)
+            else:
+                b["arrived"] = max(b["arrived"], r["arrived_at"])
+    waiting = sorted((b for b in batches.values() if b["stage"] == "pending"), key=lambda b: -b["age"])
+    arrived = sorted((b for b in batches.values() if b["stage"] == "arrived"), key=lambda b: b["arrived"], reverse=True)
+    ordered = waiting + arrived
+    got = store.one("SELECT COUNT(*) c FROM items WHERE received_at IS NOT NULL")["c"]
     if mode == "expecting":
-        late = sum(1 for b in ordered if b["age"] >= cfg.late_days)
-        header = f"📦 Expecting {n_items} item(s) in {len(ordered)} batch(es)"
+        header = (f"📦 Awaiting {len(pending) + len(at_seller)} item(s) not yet with you:\n"
+                  f"⏳ {len(pending)} not at the seller yet · 📬 {len(at_seller)} at the seller, on their way to you"
+                  + ("\nUse /received when they reach you." if at_seller else ""))
+        late = sum(1 for b in waiting if b["age"] >= cfg.late_days)
         if late:
             header += f"\n⚠️ {late} batch(es) past {cfg.late_days // 7} weeks. Maybe ask the seller?"
     else:
-        got = store.one("SELECT COUNT(*) c FROM items WHERE received_at IS NOT NULL")["c"]
-        header = (f"📬 Reached the seller, not yet received by you: {n_items} item(s) in {len(ordered)} batch(es)\n"
+        header = (f"📬 Reached the seller, not yet received by you: {len(at_seller)} item(s) in {len(arrived)} batch(es)\n"
                   "Use /received when they reach you." + (f"\n✔️ {got} item(s) already received." if got else ""))
     msgs = []
     for i in range(0, len(ordered), BATCHES_PER_MESSAGE):
         chunk = ordered[i:i + BATCHES_PER_MESSAGE]
         lines = [header if i == 0 else "(continued)"]
         for b in chunk:
-            if mode == "expecting":
+            if b["stage"] == "pending":
                 lines.append(f"{'⚠️' if b['age'] >= cfg.late_days else '⏳'} {b['head']}: {', '.join(b['names'])} ({b['age']}d)")
             else:
-                lines.append(f"✅ {b['head']}: {', '.join(b['names'])} (arrived {fmt_date(b['arrived'], cfg.tz)})")
+                lines.append(f"{'📬' if mode == 'expecting' else '✅'} {b['head']}: {', '.join(b['names'])} "
+                             f"(at seller since {fmt_date(b['arrived'], cfg.tz)})")
         buttons = [(f"#{b['tag']}", f"t:{b['post_id']}") for b in chunk if b["post_id"]]
         if buttons:
             lines.append("\nTap a # below to see the photos.")
         msgs.append({"text": "\n".join(lines),
                      "buttons": [buttons[j:j + 3] for j in range(0, len(buttons), 3)] or None})
     return msgs
+
+
+ALL_PER_MESSAGE = 12
+
+
+def all_orders(store: Store, cfg: Config, now: datetime, keyword: str | None = None) -> list[dict]:
+    """Every order at a glance: payment state and where each item is (ordered / at seller / with you)."""
+    orders = [o for o in store.orders_with_balance() if keyword_ok(keyword, o["title"])]
+    if not orders:
+        return []
+    items: dict[int, list] = {}
+    for r in store.all("SELECT i.*, p.tag, (SELECT MIN(pay.paid_at) FROM payments pay JOIN allocations a "
+                       "ON a.payment_id=pay.id WHERE a.order_id=i.order_id) AS first_paid, o.ordered_at "
+                       "FROM items i JOIN orders o ON o.id=i.order_id LEFT JOIN posts p ON p.id=i.post_id"):
+        items.setdefault(r["order_id"], []).append(r)
+    orders.sort(key=lambda o: o["ordered_at"])
+    blocks = []
+    for o in orders:
+        its = items.get(o["id"], [])
+        pend = [r for r in its if not r["arrived_at"]]
+        at = [r for r in its if r["arrived_at"] and not r["received_at"]]
+        got = [r for r in its if r["received_at"]]
+        diff = o["total_due"] - o["paid"]
+        if abs(diff) <= TOL:
+            pay = "✅ paid" + (f" (settled, was {money(o['settled_from'], cfg.currency)})" if o["settled_from"] is not None else "")
+        elif diff > 0:
+            pay = f"💸 owing {money(diff, cfg.currency)}" if o["paid"] > TOL else "💸 unpaid"
+        else:
+            pay = f"↩️ overpaid {money(-diff, cfg.currency)}"
+        late = any((now - clock_start(r, cfg.tz)).days >= cfg.late_days for r in pend)
+        parts = []
+        if pend:
+            parts.append(f"{'⚠️' if late else '⏳'} {len(pend)} ordered")
+        if at:
+            parts.append(f"📬 {len(at)} at seller")
+        if got:
+            parts.append(f"✔️ {len(got)} received")
+        tag = next((f"#{r['tag']} " for r in its if r["tag"]), "")
+        blocks.append(f"Order {o['id']} · {tag}{o['title'][:48]}\n"
+                      f"   {money(o['total_due'], cfg.currency)} · {pay} · {' · '.join(parts) or 'no items'}")
+    done = sum(1 for o in orders if all(r["received_at"] for r in items.get(o["id"], [])) and items.get(o["id"]))
+    header = f"🗂 {len(orders)} order(s), {done} fully received. Oldest first."
+    return [{"text": "\n\n".join([header if i == 0 else "(continued)"] + blocks[i:i + ALL_PER_MESSAGE])}
+            for i in range(0, len(blocks), ALL_PER_MESSAGE)]
+
+
+def settle_drafts(store: Store, order_id: int | None = None) -> list[dict]:
+    """One draft per order whose paid amount differs from its total (or just the one asked for)."""
+    rows = [o for o in store.orders_with_balance() if abs(o["total_due"] - o["paid"]) > TOL
+            and (order_id is None or o["id"] == order_id)]
+    return [{"kind": "settle", "order_id": o["id"], "title": o["title"][:60],
+             "total_due": o["total_due"], "paid": o["paid"]} for o in reversed(rows)]
 
 
 RECEIVED_PER_MESSAGE = 30
@@ -704,6 +781,8 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return [{"text": spent_text(store, cfg, month, kw)}]
     if intent == "owing":
         return [{"text": owing_text(store, cfg, kw)}]
+    if intent == "all":
+        return all_orders(store, cfg, now, kw) or [{"text": "No orders saved yet."}]
     if intent in ("status", "delivered"):
         mode = "expecting" if intent == "status" else "delivered"
         return overview(store, cfg, now, mode, kw) or [{"text": "🎉 Nothing pending." if intent == "status"
@@ -720,7 +799,7 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return cap_messages(pending_messages(store, cfg, now, rows))
     return [{"text": "To mark items as arrived, forward me the seller's arrival update and tap Confirm. "
                      "When they reach you, use /received.\n\n"
-                     "Other commands: /status, /delivered, /pending, /late, /spent, /owing, /undo, /healthcheck. "
+                     "Other commands: /status, /all, /delivered, /settle, /pending, /late, /spent, /owing, /undo, /healthcheck. "
                      "Or ask about spending, pending or late items in plain words."}]
 
 

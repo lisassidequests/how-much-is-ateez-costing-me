@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS orders (
   note TEXT,
   ordered_at TEXT NOT NULL,
   raw_text TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  settled_from REAL
 );
 CREATE TABLE IF NOT EXISTS items (
   id INTEGER PRIMARY KEY,
@@ -101,6 +102,8 @@ class Store:
         for table, column in (("items", "received_at"), ("inbox", "fingerprint")):
             if column not in {r["name"] for r in self.all(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        if "settled_from" not in {r["name"] for r in self.all("PRAGMA table_info(orders)")}:
+            self.db.execute("ALTER TABLE orders ADD COLUMN settled_from REAL")
         # payments used to link to a single order (payments.order_id); they now split across orders via allocations
         self.db.execute("INSERT INTO allocations(payment_id,order_id,amount) SELECT id, order_id, amount FROM payments "
                         "WHERE order_id IS NOT NULL AND id NOT IN (SELECT payment_id FROM allocations)")
