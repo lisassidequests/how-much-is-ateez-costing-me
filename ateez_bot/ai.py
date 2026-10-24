@@ -16,7 +16,7 @@ Call the record_message tool exactly once. Never answer in prose.
 The buyer purchases through a seller's Telegram channel ("ange's ins"). Message types:
 
 1. channel_post - a forwarded channel announcement (usually a photo plus caption) for a group order.
-   It contains a serial hashtag like #anghp6_4 (return it WITHOUT the '#', lowercase) and a product
+   It contains a serial hashtag like #anghp6_4 (return it WITHOUT the '#', lowercase, keeping any hyphens/underscores) and a product
    name, e.g. "[po] #anghp6_4 ateez golden hour pt.6 makestar fansign 1.0 ribbon puppy ver."
    Return tag, title (product name without "[po]" or the tag), price_note (e.g. "$6.50 fp per member").
    The first-person status lines further down (names with check marks) are claim lists; ignore them.
@@ -41,9 +41,14 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
 3. payment_proof - a screenshot of a bank/PayNow/PayLah transfer. Return amount, paid_at (ISO 8601 date or
    datetime as shown on the screenshot, else null) and reference (any recipient/comment text).
 
-4. arrival_update - the seller saying items have arrived, usually citing serial numbers like #anghp6_4
-   and sometimes member/item names. Return tags (list, no '#'), names (list of member/item names
-   mentioned, may be empty) and note.
+4. arrival_update - the seller announcing that items have reached her. Often a mass "[ARRIVAL PROOF]" post,
+   forwarded from a channel WITH a photo of the cards, listing many hashtags each followed by a quantity, e.g.
+   "#anghp5_2 (quantity: x4 unit pcs)  #anghp5_8 (quantity: x1 OT8)  #ANATZ38-2 (quantity: x4 pcs) ...
+   [MAILING NOTICE] 31 AUGUST 2026". That is an arrival_update, NOT a channel_post, even though it is a
+   forwarded channel photo post. Hashtags can contain hyphens (#ANATZ38-2): return the full serial
+   lowercase ("anatz38-2"). Return arrivals = one entry per hashtag {tag, quantity}, where quantity is the
+   bracketed text exactly as written ("x4 unit pcs"); also tags (the same list), names (member/item names
+   mentioned, may be empty) and note. Most hashtags in a mass post belong to other buyers: list them all.
 
 5. question - the buyer asking about their own records (typed, not forwarded). Return question
    with intent one of: spent, pending (text list), pending_photos (when they ask to see pictures
@@ -83,6 +88,10 @@ TOOL = {
             "paid_at": {"type": ["string", "null"]},
             "reference": {"type": ["string", "null"]},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "arrivals": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"tag": {"type": "string"}, "quantity": {"type": ["string", "null"]}},
+                "required": ["tag"]}},
             "names": {"type": "array", "items": {"type": "string"}},
             "intent": {"type": ["string", "null"],
                        "enum": ["spent", "pending", "pending_photos", "late", "owing", None]},
@@ -123,13 +132,18 @@ def classify_error(exc: Exception) -> AIUnavailable | None:
     return None
 
 
-def fallback_tag(text: str | None) -> str | None:
-    """Regex backup for the serial hashtag if the model misses it."""
+def fallback_tags(text: str | None) -> list[str]:
+    """Regex backup for serial hashtags (may contain _ and -) if the model misses them."""
     if not text:
-        return None
-    for m in re.finditer(r"#([A-Za-z]+[A-Za-z0-9_]*\d[A-Za-z0-9_]*)", text):
-        return m.group(1).lower()
-    return None
+        return []
+    found = [m.group(1).rstrip("-_").lower()
+             for m in re.finditer(r"#([A-Za-z][A-Za-z0-9_\-]*\d[A-Za-z0-9_\-]*)", text)]
+    return list(dict.fromkeys(found))
+
+
+def fallback_tag(text: str | None) -> str | None:
+    tags = fallback_tags(text)
+    return tags[0] if tags else None
 
 
 class Parser:

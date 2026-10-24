@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from ateez_bot import pipeline as pl
-from ateez_bot.ai import AIUnavailable, classify_error, fallback_tag
+from ateez_bot.ai import AIUnavailable, classify_error, fallback_tag, fallback_tags
 from ateez_bot.bot import BotApp
 from ateez_bot.config import Config
 from ateez_bot.store import Store
@@ -247,6 +247,39 @@ def test_item_names_drop_seller_count_prefix(env):
     out = ingest(store, FakeParser(parsed), cfg, text="order")
     assert out["draft"]["items"][0]["name"] == "OT8"
     assert pl.clean_name("x2 HONGJOONG") == "HONGJOONG" and pl.clean_name("OT4 UNIT") == "OT4 UNIT"
+
+
+MASS_PROOF = {"kind": "arrival_update", "summary": "mass proof", "tags": [], "names": [], "arrivals": [
+    {"tag": "anghp5_2", "quantity": "x4 unit pcs"}, {"tag": "anghp5_4", "quantity": "x2 unit pcs"},
+    {"tag": "anghp5_8", "quantity": "x1 OT8"}, {"tag": "anatz38-2", "quantity": "x4 pcs"},
+    {"tag": "anatz56", "quantity": "x1 OT8"}]}
+
+
+def test_mass_arrival_proof_ignores_other_buyers_tags(env):
+    cfg, store = env
+    setup_orders(store, cfg, datetime.now(TZ))
+    out = ingest(store, FakeParser(MASS_PROOF), cfg, text="[ARRIVAL PROOF] ...", photo="PROOF", channel=True)
+    d = out["draft"]
+    assert d["kind"] == "arrival" and len(d["item_ids"]) == 2           # only your own batch
+    assert d["quantities"] == {"anghp5_2": "x4 unit pcs"}
+    assert any("Ignored 4 other hashtag" in w for w in d["warnings"])
+    assert not any("isn't one of your saved posts" in w for w in d["warnings"])  # no noise about others' tags
+    assert "x4 unit pcs" in pl.render_draft(d, "S$", TZ)
+
+
+def test_mass_arrival_proof_with_nothing_of_yours(env):
+    cfg, store = env
+    out = ingest(store, FakeParser(MASS_PROOF), cfg, text="[ARRIVAL PROOF] ...", photo="PROOF", channel=True)
+    assert out["type"] == "info" and "none of its hashtags" in out["text"]
+
+
+def test_hyphenated_serials_match_either_way(env):
+    cfg, store = env
+    store.upsert_post("anatz38-2", "some post", None, [], None, None, None)
+    for variant in ("anatz38-2", "ANATZ38_2", "anatz382"):
+        assert store.find_post_by_tag(variant)["tag"] == "anatz38-2"
+    assert store.find_post_by_tag("anatz38") is None   # no sloppy prefix matching
+    assert fallback_tags("#ANATZ38-2 (quantity: x4 pcs) #anghp5_2") == ["anatz38-2", "anghp5_2"]
 
 
 def test_fallback_tag():

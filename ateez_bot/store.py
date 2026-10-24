@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,6 +118,17 @@ class Store:
     # -- posts -------------------------------------------------------------
     def get_post_by_tag(self, tag: str):
         return self.one("SELECT * FROM posts WHERE tag=?", (tag.lower(),))
+
+    def find_post_by_tag(self, tag: str):
+        """Exact match, else a match ignoring - and _ (Telegram cuts hashtags at hyphens), if unique."""
+        row = self.get_post_by_tag(tag)
+        if row:
+            return row
+        norm = re.sub(r"[^a-z0-9]", "", tag.lower())
+        if not norm:
+            return None
+        hits = [p for p in self.all("SELECT * FROM posts") if re.sub(r"[^a-z0-9]", "", p["tag"]) == norm]
+        return hits[0] if len(hits) == 1 else None
 
     def get_post(self, post_id: int):
         return self.one("SELECT * FROM posts WHERE id=?", (post_id,))

@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .ai import AIUnavailable, fallback_tag
+from .ai import AIUnavailable, fallback_tag, fallback_tags
 from .config import Config
 from .store import Store
 
@@ -109,7 +109,7 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
             warnings.append(f"Items add up to {item_sum:.2f} but the total says {total:.2f}. Check before confirming.")
         post_id = post_tag = None
         mt = (parsed.get("matched_tag") or "").lstrip("#").lower()
-        post = store.get_post_by_tag(mt) if mt and parsed.get("match_confidence") != "low" else None
+        post = store.find_post_by_tag(mt) if mt and parsed.get("match_confidence") != "low" else None
         cands = post_candidates(store, title)
         if post is None and cands:  # cheap fallback if the model found nothing
             best = store.get_post(cands[0]["id"])
@@ -142,32 +142,48 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                 "candidates": cands, "warnings": warnings}
 
     if kind == "arrival_update":
-        tags = [t.lstrip("#").lower() for t in parsed.get("tags") or [] if t]
-        if not tags and (t := fallback_tag(ctx.get("raw_text"))):
-            tags = [t]
+        qty_by_tag: dict[str, str] = {}
+        tags: list[str] = []
+        for a in parsed.get("arrivals") or []:
+            t = (a.get("tag") or "").lstrip("#").lower()
+            if t:
+                tags.append(t)
+                if a.get("quantity"):
+                    qty_by_tag[t] = a["quantity"]
+        tags += [t.lstrip("#").lower() for t in parsed.get("tags") or [] if t]
+        if not tags:
+            tags = fallback_tags(ctx.get("raw_text"))
+        tags = list(dict.fromkeys(tags))
         names = [n for n in parsed.get("names") or [] if n]
         pending = store.items_pending()
-        chosen, warnings = [], []
-        if tags:
-            for tag in tags:
-                group = [r for r in pending if r["tag"] == tag]
-                if store.get_post_by_tag(tag) is None:
-                    warnings.append(f"#{tag} isn't one of your saved posts.")
-                if names and group:
-                    named = [r for r in group if name_match(names, r["name"])]
-                    if named:
-                        group = named
-                    else:
-                        warnings.append(f"Couldn't match {', '.join(names)} under #{tag}; including all its pending items.")
-                chosen += group
-        elif names:
+        chosen, mine, quantities, warnings = [], [], {}, []
+        for tag in tags:
+            post = store.find_post_by_tag(tag)
+            canon = post["tag"] if post else tag
+            group = [r for r in pending if r["tag"] == canon]
+            if not group or canon in mine:
+                continue  # another buyer's batch, or already marked arrived: ignore silently
+            if names:
+                named = [r for r in group if name_match(names, r["name"])]
+                if named:
+                    group = named
+                else:
+                    warnings.append(f"Couldn't match {', '.join(names)} under #{canon}; including all its pending items.")
+            chosen += group
+            mine.append(canon)
+            if tag in qty_by_tag:
+                quantities[canon] = qty_by_tag[tag]
+        ignored = len(tags) - len(mine)
+        if mine and ignored > 0:
+            warnings.append(f"Ignored {ignored} other hashtag(s) that aren't in your pending orders.")
+        if not tags and names:
             chosen = [r for r in pending if name_match(names, r["name"])]
             warnings.append("No #serial in the message, so I matched by item names only.")
         if not chosen:
-            return {"kind": "unreadable", "reason": "Arrival notice read, but no pending items matched it."
+            return {"kind": "unreadable", "reason": "Arrival notice read, but none of its hashtags match your pending items."
                     + ("".join(f"\n⚠️ {w}" for w in warnings))}
-        return {"kind": "arrival", "tags": tags, "names": names, "note": parsed.get("note"),
-                "item_ids": [r["id"] for r in chosen],
+        return {"kind": "arrival", "tags": mine, "names": names, "note": parsed.get("note"),
+                "quantities": quantities, "item_ids": [r["id"] for r in chosen],
                 "items": [f"{r['name']} ×{r['qty']}" + (f" (#{r['tag']})" if r["tag"] else "") for r in chosen],
                 "arrived_at": msg_dt.isoformat(), "warnings": warnings}
 
@@ -196,7 +212,9 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
     if k == "arrival":
         lines = "\n".join(f"• {i}" for i in d["items"])
         note = f"\nNote: {d['note']}" if d.get("note") else ""
-        return f"📦 Arrived ({len(d['items'])} item(s)):\n{lines}{note}{warn}"
+        qty = d.get("quantities") or {}
+        qlines = ("\nSeller says:\n" + "\n".join(f"• #{t}: {q}" for t, q in qty.items())) if qty else ""
+        return f"📦 Arrived ({len(d['items'])} item(s)):\n{lines}{qlines}{note}{warn}"
     return f"❓ {d.get('reason', 'Not understood.')}"
 
 
