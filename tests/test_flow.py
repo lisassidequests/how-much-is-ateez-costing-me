@@ -348,6 +348,7 @@ def test_mass_arrival_proof_with_nothing_of_yours(env):
     cfg, store = env
     out = ingest(store, FakeParser(MASS_PROOF), cfg, text="[ARRIVAL PROOF] ...", photo="PROOF", channel=True)
     assert out["type"] == "info" and "none of its hashtags" in out["text"]
+    assert "#anghp5_2" in out["text"] and "None of them are posts you've saved" in out["text"]
 
 
 def test_hyphenated_serials_match_either_way(env):
@@ -518,6 +519,39 @@ def test_arrival_links_orders_even_if_post_was_saved_first(env):
     arr = {"kind": "arrival_update", "summary": "x", "tags": ["ANATZ56"], "names": []}
     out = ingest(store, FakeParser(arr), cfg, text="#ANATZ56 arrived")
     assert out["draft"]["kind"] == "arrival" and "Linked 1 earlier order" in out["draft"]["note"]
+
+
+def test_shared_ot8_listing_marks_all_of_your_cards_arrived(env):
+    """You hold 4 single cards from a listing whose x1 OT8 is split across buyers: her count is for the
+    whole listing, so it must not be compared with yours."""
+    cfg, store = env
+    title = 'ATEEZ 7TH MEMBERSHIP KIT "GHOSTEEZ" PCS'
+    order = {"kind": "order_confirmation", "summary": "o", "title": title, "total_due": 18.0,
+             "items": [{"name": n, "qty": 1, "line_total": 4.5} for n in ("SEONGHWA", "MINGI", "YEOSANG", "WOOYOUNG")]}
+    old = datetime.now(TZ) - timedelta(days=72)
+    confirm(store, ingest(store, FakeParser(order), cfg, text="order", when=old), cfg)
+    post = {"kind": "channel_post", "summary": "p", "tag": "anatz59",
+            "title": "ATEEZ 7TH MEMBERSHIP KIT \u201cGHOSTEEZ\u201d PCS"}                 # curly quotes this time
+    assert "Linked 1 earlier order" in confirm(
+        store, ingest(store, FakeParser(post), cfg, text="[PO CLOSED] #ANATZ59 ...", photo="P", channel=True), cfg)
+    proof = {"kind": "arrival_update", "summary": "mass", "tags": [], "names": [], "arrivals": [
+        {"tag": "ANATZ57", "quantity": "x8 + x1 admin claim"}, {"tag": "ANATZ58", "quantity": "x8 + x2 admin claim, x2 OT8"},
+        {"tag": "ANATZ59", "quantity": "x1 OT8"}, {"tag": "ANATZ60", "quantity": "x2 OT8"}]}
+    d = ingest(store, FakeParser(proof), cfg, text="[ARRIVAL PROOF] ...", photo="X", channel=True)["draft"]
+    assert len(d["item_ids"]) == 4 and d["quantities"] == {"anatz59": "x1 OT8"}
+    assert "whole listing (all buyers)" in pl.render_draft(d, "S$", TZ)
+
+
+def test_unmatched_arrival_explains_why(env):
+    cfg, store = env
+    store.add_order(None, "SOME UNLINKED ORDER TITLE", 5.0, None, None, datetime.now(TZ).isoformat(), "x",
+                    [{"name": "SAN", "qty": 1, "line_total": 5.0}])
+    store.upsert_post("anatz59", "A different product entirely", None, [], None, None, None)
+    proof = {"kind": "arrival_update", "summary": "m", "tags": ["anatz59", "anatz60"], "names": []}
+    text = ingest(store, FakeParser(proof), cfg, text="x")["text"]
+    assert "Hashtags I read: #anatz59, #anatz60" in text
+    assert "Saved posts among them: #anatz59, but you have no pending items under them" in text
+    assert "aren't linked to any post" in text and "SOME UNLINKED ORDER" in text
 
 
 def test_fallback_tag():

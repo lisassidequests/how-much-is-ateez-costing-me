@@ -292,8 +292,17 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                 return {"kind": "unreadable", "reason": "Already recorded: your items under these hashtags were marked "
                         f"arrived on {fmt_date(max(r['arrived_at'] for r in done), tz)}. "
                         "You may have forwarded this before. Nothing to do."}
-            return {"kind": "unreadable", "reason": "Arrival notice read, but none of its hashtags match your pending items."
-                    + ("".join(f"\n⚠️ {w}" for w in warnings))}
+            known = [store.find_post_by_tag(t)["tag"] for t in tags if store.find_post_by_tag(t)]
+            detail = [f"Hashtags I read: {', '.join('#' + t for t in tags) or '(none)'}."]
+            detail.append(("Saved posts among them: " + ", ".join(f"#{t}" for t in known)
+                           + ", but you have no pending items under them.") if known
+                          else "None of them are posts you've saved.")
+            unlinked = [r for r in pending if not r["tag"]]
+            if unlinked:
+                detail.append(f"{len(unlinked)} of your pending item(s) aren't linked to any post "
+                              f"(e.g. {unlinked[0]['order_title'][:45]}). If one is yours, forward its channel post first.")
+            return {"kind": "unreadable", "reason": "Arrival notice read, but none of its hashtags match your pending items.\n"
+                    + "\n".join(detail) + ("".join(f"\n⚠️ {w}" for w in warnings))}
         note = " ".join(x for x in [parsed.get("note"),
                                     f"(Linked {relinked} earlier order(s) to their posts.)" if relinked else None] if x) or None
         return {"kind": "arrival", "tags": mine, "names": names, "note": note,
@@ -346,7 +355,7 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
         lines = "\n".join(f"• {i}" for i in d["items"])
         note = f"\nNote: {d['note']}" if d.get("note") else ""
         qty = d.get("quantities") or {}
-        qlines = ("\nSeller says:\n" + "\n".join(f"• #{t}: {q}" for t, q in qty.items())) if qty else ""
+        qlines = ("\nSeller's count for the whole listing (all buyers):\n" + "\n".join(f"• #{t}: {q}" for t, q in qty.items())) if qty else ""
         return f"📦 Arrived ({len(d['items'])} item(s)):\n{lines}{qlines}{note}{warn}"
     return f"❓ {d.get('reason', 'Not understood.')}"
 
