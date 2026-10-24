@@ -33,6 +33,10 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
      Group sizes: "OT8" = one piece of each of the 8 members (8 pieces); "OT4" = 4 pieces.
      A set like "X1 OT8" is qty 8; keep the item name as "OT8" (no "X1").
    - total_due = the "Total to transfer" amount. mailing_fee only if stated separately.
+   - is_second_payment = true ONLY if THIS message asks for the second / final payment, i.e. the shipping or
+     reconsolidated shipping cost after the goods shipped (wording like "second payment", "final payment", "shipping
+     fee"). false for a first request that merely says a second payment is still pending. The items may be missing
+     or repeated in such a message; total_due is the amount to transfer now.
    - note = short remark such as "first payment, pending second payment" when present.
    - matched_tag: compare title against the KNOWN POSTS list given by the user and return the tag
      of the post it clearly refers to (same product/event and version), else null. Do not guess
@@ -82,6 +86,7 @@ TOOL = {
             "total_due": {"type": ["number", "null"]},
             "mailing_fee": {"type": ["number", "null"]},
             "note": {"type": ["string", "null"]},
+            "is_second_payment": {"type": ["boolean", "null"]},
             "matched_tag": {"type": ["string", "null"]},
             "match_confidence": {"type": ["string", "null"], "enum": ["high", "medium", "low", None]},
             "amount": {"type": ["number", "null"]},

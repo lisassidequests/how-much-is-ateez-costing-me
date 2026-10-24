@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS orders (
   ordered_at TEXT NOT NULL,
   raw_text TEXT,
   created_at TEXT NOT NULL,
-  settled_from REAL
+  settled_from REAL,
+  topup REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS items (
   id INTEGER PRIMARY KEY,
@@ -103,6 +104,8 @@ class Store:
         for table, column in (("items", "received_at"), ("inbox", "fingerprint")):
             if column not in {r["name"] for r in self.all(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        if "topup" not in {r["name"] for r in self.all("PRAGMA table_info(orders)")}:
+            self.db.execute("ALTER TABLE orders ADD COLUMN topup REAL NOT NULL DEFAULT 0")
         if "settled_from" not in {r["name"] for r in self.all("PRAGMA table_info(orders)")}:
             self.db.execute("ALTER TABLE orders ADD COLUMN settled_from REAL")
         if "assumed" not in {r["name"] for r in self.all("PRAGMA table_info(payments)")}:

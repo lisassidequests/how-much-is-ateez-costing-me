@@ -35,6 +35,7 @@ HELP = (
     "/undo: reverse the last thing you confirmed\n"
     "/status [name]: everything you're still awaiting (not at the seller yet, or at the seller but not with you), "
     "with a button per # for the photos\n"
+    "/merge <extra order no.> <original order no.>: fold an order that was really a second (shipping) payment into the original\n"
     "/all [name]: every order at a glance: paid or owing, and where each item is\n"
     "/settle [order no.]: close an order whose total and payments don't match, treating what you paid as final\n"
     "/delivered [name]: arrived with the seller but not with you yet (# buttons too)\n"
@@ -198,6 +199,22 @@ class BotApp:
             await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
                             reply_markup=markup(pl.draft_buttons(draft_id, d)))
 
+    async def cmd_merge(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        nums = [a.lstrip("#") for a in ctx.args]
+        if len(nums) != 2 or not all(n.isdigit() for n in nums):
+            await update.effective_message.reply_text(
+                "Usage: /merge <second-payment order no.> <original order no.>, e.g. /merge 5 1")
+            return
+        d = pl.merge_draft(self.store, int(nums[0]), int(nums[1]))
+        if isinstance(d, str):
+            await update.effective_message.reply_text(d)
+            return
+        draft_id = self.store.draft_add("merge", d)
+        await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                        reply_markup=markup(pl.draft_buttons(draft_id, d)))
+
     async def cmd_received(self, update: Update, ctx):
         if not self.authorized(update):
             return
@@ -353,6 +370,7 @@ class BotApp:
                 ("pending_photos", "What hasn't arrived yet, with photos"),
                 ("status", "Everything I'm still awaiting (tap # for photos)"),
                 ("all", "Every order and its status at a glance"),
+                ("merge", "Fold a second-payment order into the original"),
                 ("settle", "Close an order whose payments don't match its total"),
                 ("delivered", "Arrived with the seller, not yet with me"),
                 ("received", "Mark what has reached me"),
@@ -371,7 +389,7 @@ class BotApp:
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
                          ("status", self.cmd_status), ("delivered", self.cmd_delivered),
-                         ("received", self.cmd_received), ("all", self.cmd_all), ("settle", self.cmd_settle)]:
+                         ("received", self.cmd_received), ("all", self.cmd_all), ("settle", self.cmd_settle), ("merge", self.cmd_merge)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(

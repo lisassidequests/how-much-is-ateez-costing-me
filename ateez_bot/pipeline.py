@@ -156,6 +156,18 @@ def toggle_payment_order(store: Store, draft_id: int, order_id: int) -> dict:
     return d
 
 
+def find_topup_targets(store: Store, title: str, items: list[dict]) -> list:
+    """Earlier orders a second payment could belong to: same product, not already topped up, oldest first.
+    If the message lists items, prefer orders with exactly those items."""
+    cands = [o for o in store.orders_with_balance() if not o["topup"] and sim(title, o["title"]) >= 0.85]
+    names = sorted(" ".join(_tokens(i["name"])) for i in items)
+    if names:
+        exact = [o for o in cands if sorted(" ".join(_tokens(r["name"])) for r in
+                                            store.all("SELECT name FROM items WHERE order_id=?", (o["id"],))) == names]
+        cands = exact or cands
+    return sorted(cands, key=lambda o: o["id"])
+
+
 def post_candidates(store: Store, title: str, n: int = 5) -> list[dict]:
     scored = sorted(((sim(title, p["title"]), p) for p in store.recent_posts(200)),
                     key=lambda t: t[0], reverse=True)
@@ -189,10 +201,25 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
         item_sum = round(sum(i["line_total"] for i in items), 2)
         total = parsed.get("total_due")
         total = float(total) if total is not None else (item_sum or None)
-        if total is None or not items:
-            return {"kind": "unreadable", "reason": "I couldn't read the items or total from this order message."}
         title = parsed.get("title") or "(untitled order)"
         warnings = []
+        if parsed.get("is_second_payment") and total:
+            # the shipping/consolidation payment: adds to the earlier order's cost, no new items or statuses
+            targets = find_topup_targets(store, title, items)
+            if targets:
+                o = targets[0]
+                tag = store.one("SELECT p.tag FROM posts p JOIN orders x ON x.post_id=p.id WHERE x.id=?", (o["id"],))
+                if len(targets) > 1:
+                    warnings.append(f"{len(targets)} earlier orders match this product; added to the oldest (Order {o['id']}). "
+                                    "Cancel if it belongs to another.")
+                return {"kind": "topup", "order_id": o["id"], "title": o["title"], "tag": tag["tag"] if tag else None,
+                        "amount": total, "old_total": o["total_due"], "paid_at": msg_dt.isoformat(), "warnings": warnings}
+            if not items:
+                return {"kind": "unreadable", "reason": "This looks like a second payment, but I can't find the first "
+                        "order for it. Forward the original order message first."}
+            warnings.append("This looks like a second payment but I couldn't find the first order, so it is shown as a new order.")
+        if total is None or not items:
+            return {"kind": "unreadable", "reason": "I couldn't read the items or total from this order message."}
         if abs(item_sum - total) > TOL:
             warnings.append(f"Items add up to {item_sum:.2f} but the total says {total:.2f}. Check before confirming.")
         dup = find_duplicate_order(store, title, total, items)
@@ -327,6 +354,16 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
             lines += [f"{'☑️' if it['id'] in sel else '☐'} {it['name']} ×{it['qty']} "
                       f"(arrived {fmt_date(it['arrived_at'], tz)})" for it in its]
         return "\n".join(lines)
+    if k == "topup":
+        tag = f" (#{d['tag']})" if d.get("tag") else ""
+        return (f"➕ Second payment {money(d['amount'], cur)} for Order {d['order_id']}{tag}: {d['title'][:50]}\n"
+                f"Added to that item's cost: {money(d['old_total'], cur)} → {money(d['old_total'] + d['amount'], cur)}. "
+                f"Counted as paid; no new items or statuses.{warn}")
+    if k == "merge":
+        return (f"🧩 Merge Order {d['from_id']} into Order {d['into_id']}?\n"
+                f"Order {d['from_id']} ({money(d['amount'], cur)}, {d['n_items']} item(s)) becomes a second payment on "
+                f"Order {d['into_id']} ({d['into_title'][:45]}). Its items are removed; the amount is added to the cost. "
+                "/undo reverses it.")
     if k == "settle":
         diff = d["total_due"] - d["paid"]
         what = (f"you still owe {money(diff, cur)}" if diff > 0 else f"you overpaid by {money(-diff, cur)}")
@@ -450,6 +487,26 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
                 text += f"\n⚠️ {money(remainder, cur)} wasn't allocated to any order."
         else:
             text += " (not linked to an order)"
+    elif k == "topup":
+        store.run("UPDATE orders SET total_due=total_due+?, topup=topup+? WHERE id=?",
+                  (d["amount"], d["amount"], d["order_id"]))
+        pid = store.add_payment(d["amount"], d["paid_at"], "second payment", assumed=True)
+        store.add_allocation(pid, d["order_id"], d["amount"])
+        result = {"type": "topup", "order_id": d["order_id"], "amount": d["amount"], "payment_id": pid}
+        text = f"✅ Added {money(d['amount'], cur)} to Order {d['order_id']}'s cost, counted as paid."
+    elif k == "merge":
+        src = store.one("SELECT * FROM orders WHERE id=?", (d["from_id"],))
+        dst = store.one("SELECT id FROM orders WHERE id=?", (d["into_id"],))
+        if not src or not dst:
+            raise ValueError("One of those orders no longer exists.")
+        snap = {"order": dict(src), "items": [dict(r) for r in store.all("SELECT * FROM items WHERE order_id=?", (src["id"],))],
+                "alloc_ids": [r["id"] for r in store.all("SELECT id FROM allocations WHERE order_id=?", (src["id"],))]}
+        store.run("UPDATE allocations SET order_id=? WHERE order_id=?", (dst["id"], src["id"]))
+        store.run("UPDATE orders SET total_due=total_due+?, topup=topup+? WHERE id=?",
+                  (src["total_due"], src["total_due"], dst["id"]))
+        store.run("DELETE FROM orders WHERE id=?", (src["id"],))
+        result = {"type": "merge", "into_id": dst["id"], "snapshot": snap}
+        text = f"✅ Merged Order {src['id']} into Order {dst['id']} ({money(src['total_due'], cur)} added to its cost)."
     elif k == "settle":
         o = store.one("SELECT total_due FROM orders WHERE id=?", (d["order_id"],))
         if not o:
@@ -506,6 +563,23 @@ def undo_last(store: Store) -> str:
                 pid = store.add_payment(a["amount"], a["paid_at"], a["reference"], assumed=True)
                 store.add_allocation(pid, a["order_id"], a["amount"])
         msg = "Removed the last payment."
+    elif r["type"] == "topup":
+        store.run("DELETE FROM payments WHERE id=?", (r["payment_id"],))
+        store.run("UPDATE orders SET total_due=total_due-?, topup=topup-? WHERE id=?",
+                  (r["amount"], r["amount"], r["order_id"]))
+        msg = f"Removed the second payment from order {r['order_id']}."
+    elif r["type"] == "merge":
+        snap = r["snapshot"]
+        o = snap["order"]
+        cols = ",".join(o)
+        store.run(f"INSERT INTO orders({cols}) VALUES({','.join('?' * len(o))})", list(o.values()))
+        for it in snap["items"]:
+            store.run(f"INSERT INTO items({','.join(it)}) VALUES({','.join('?' * len(it))})", list(it.values()))
+        for aid in snap["alloc_ids"]:
+            store.run("UPDATE allocations SET order_id=? WHERE id=?", (o["id"], aid))
+        store.run("UPDATE orders SET total_due=total_due-?, topup=topup-? WHERE id=?",
+                  (o["total_due"], o["total_due"], r["into_id"]))
+        msg = f"Un-merged: order {o['id']} is back."
     elif r["type"] == "settle":
         store.run("UPDATE orders SET total_due=?, settled_from=NULL WHERE id=?", (r["old_total"], r["order_id"]))
         msg = f"Reopened order {r['order_id']} (total back to {r['old_total']:.2f})."
@@ -678,12 +752,27 @@ def all_orders(store: Store, cfg: Config, now: datetime, keyword: str | None = N
         if got:
             parts.append(f"✔️ {len(got)} received")
         tag = next((f"#{r['tag']} " for r in its if r["tag"]), "")
+        total = money(o["total_due"], cfg.currency) + (
+            f" (incl. {money(o['topup'], cfg.currency)} 2nd payment)" if o["topup"] else "")
         blocks.append(f"Order {o['id']} · {tag}{o['title'][:48]}\n"
-                      f"   {money(o['total_due'], cfg.currency)} · {pay} · {' · '.join(parts) or 'no items'}")
+                      f"   {total} · {pay} · {' · '.join(parts) or 'no items'}")
     done = sum(1 for o in orders if all(r["received_at"] for r in items.get(o["id"], [])) and items.get(o["id"]))
     header = f"🗂 {len(orders)} order(s), {done} fully received. Oldest first."
     return [{"text": "\n\n".join([header if i == 0 else "(continued)"] + blocks[i:i + ALL_PER_MESSAGE])}
             for i in range(0, len(blocks), ALL_PER_MESSAGE)]
+
+
+def merge_draft(store: Store, from_id: int, into_id: int) -> dict | str:
+    """Fold an order that was really a second (shipping) payment into the original order."""
+    if from_id == into_id:
+        return "Pick two different orders."
+    src = store.one("SELECT * FROM orders WHERE id=?", (from_id,))
+    dst = store.one("SELECT * FROM orders WHERE id=?", (into_id,))
+    if not src or not dst:
+        return f"I can't find order {from_id if not src else into_id}."
+    n = store.one("SELECT COUNT(*) c FROM items WHERE order_id=?", (from_id,))["c"]
+    return {"kind": "merge", "from_id": from_id, "into_id": into_id, "amount": src["total_due"],
+            "n_items": n, "into_title": dst["title"]}
 
 
 def settle_drafts(store: Store, order_id: int | None = None) -> list[dict]:
@@ -815,7 +904,7 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return cap_messages(pending_messages(store, cfg, now, rows))
     return [{"text": "To mark items as arrived, forward me the seller's arrival update and tap Confirm. "
                      "When they reach you, use /received.\n\n"
-                     "Other commands: /status, /all, /delivered, /settle, /pending, /late, /spent, /owing, /undo, /healthcheck. "
+                     "Other commands: /status, /all, /delivered, /settle, /merge, /pending, /late, /spent, /owing, /undo, /healthcheck. "
                      "Or ask about spending, pending or late items in plain words."}]
 
 

@@ -617,3 +617,45 @@ def test_order_counts_as_paid_and_screenshot_replaces_it(env):
     assert "Nothing owing" in pl.owing_text(store, cfg)
     assert "Removed order 1" in pl.undo_last(store)
     assert store.one("SELECT COUNT(*) c FROM payments")["c"] == 0
+
+
+def test_second_payment_adds_to_original_order_cost(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    setup_orders(store, cfg, now)
+    first = store.one("SELECT * FROM orders WHERE id=1")
+    before_items = store.one("SELECT COUNT(*) c FROM items")["c"]
+    second = {"kind": "order_confirmation", "summary": "2nd", "title": first["title"], "total_due": 4.0,
+              "is_second_payment": True, "items": [], "note": "second payment, reconsolidated shipping"}
+    out = ingest(store, FakeParser(second), cfg, text="second payment", when=now)
+    assert out["draft"]["kind"] == "topup" and out["draft"]["order_id"] == 1
+    assert "Second payment S$4.00 for Order 1" in pl.render_draft(out["draft"], "S$", TZ)
+    confirm(store, out, cfg)
+    o = {r["id"]: r for r in store.orders_with_balance()}[1]
+    assert round(o["total_due"], 2) == round(first["total_due"] + 4, 2) and o["topup"] == 4.0
+    assert o["paid"] == o["total_due"]                                     # counted as paid
+    assert store.one("SELECT COUNT(*) c FROM items")["c"] == before_items  # no new items, no new status
+    assert "(incl. S$4.00 2nd payment)" in pl.answer_question(store, cfg, {"intent": "all"}, now)[0]["text"]
+    assert "Removed the second payment" in pl.undo_last(store)
+    assert {r["id"]: r for r in store.orders_with_balance()}[1]["total_due"] == first["total_due"]
+
+
+def test_merge_existing_order_into_original_and_undo(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    setup_orders(store, cfg, now)
+    extra = store.add_order(None, "X", 2.0, None, None, now.isoformat(), "x", [{"name": "SAN", "qty": 1, "line_total": 2.0}])[0]
+    pid = store.add_payment(2.0, now.isoformat(), None, assumed=True)
+    store.add_allocation(pid, extra, 2.0)
+    d = pl.merge_draft(store, extra, 1)
+    assert "becomes a second payment" in pl.render_draft(d, "S$", TZ)
+    total1 = store.one("SELECT total_due FROM orders WHERE id=1")["total_due"]
+    did = store.draft_add("merge", d)
+    assert "Merged" in pl.apply_draft(store, did, "S$", TZ)
+    assert store.one("SELECT id FROM orders WHERE id=?", (extra,)) is None
+    o = {r["id"]: r for r in store.orders_with_balance()}[1]
+    assert round(o["total_due"], 2) == round(total1 + 2, 2) and round(o["paid"], 2) == round(o["total_due"], 2)
+    assert "Un-merged" in pl.undo_last(store)
+    assert store.one("SELECT id FROM orders WHERE id=?", (extra,)) is not None
+    assert store.one("SELECT total_due, topup FROM orders WHERE id=1")["total_due"] == total1
+    assert pl.merge_draft(store, 1, 1) == "Pick two different orders."
