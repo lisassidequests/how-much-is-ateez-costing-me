@@ -13,6 +13,8 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 
 **Second payments:** when the seller later asks for the second (shipping) payment, forward it like any order message. The bot recognises it, adds the amount to the original order's cost (so it counts under that #tag) and creates no new items or statuses. If an earlier one was saved as its own order, `/merge 5 1` folds order 5 into order 1.
 
+**Wrong total?** Tap ✏️ Edit total on the order before confirming, then send the right number (e.g. `80`). For an order already saved, use `/total 14 80`.
+
 **Duplicate check:** if you forward the exact same message twice, or an order or payment that matches one you already saved (same product, items and total / same amount on the same day), the confirmation carries a ⚠️ "Possible duplicate" line. Tap Confirm to save it anyway (for a genuine repeat purchase) or Cancel. If an arrival notice only covers items already marked arrived, the bot just tells you so.
 
 ## Commands

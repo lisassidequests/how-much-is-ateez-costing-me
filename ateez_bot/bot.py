@@ -35,6 +35,7 @@ HELP = (
     "/undo: reverse the last thing you confirmed\n"
     "/status [name]: everything you're still awaiting (not at the seller yet, or at the seller but not with you), "
     "with a button per # for the photos\n"
+    "/total <order no.> <amount>: correct a saved order's total (you can also tap ✏️ Edit total on an order before confirming)\n"
     "/merge <extra order no.> <original order no.>: fold an order that was really a second (shipping) payment into the original\n"
     "/all [name]: every order at a glance: paid or owing, and where each item is\n"
     "/settle [order no.]: close an order whose total and payments don't match, treating what you paid as final\n"
@@ -199,6 +200,22 @@ class BotApp:
             await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
                             reply_markup=markup(pl.draft_buttons(draft_id, d)))
 
+    async def cmd_total(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        nums = [a.lstrip("#") for a in ctx.args]
+        amount = pl.parse_amount(nums[1]) if len(nums) == 2 else None
+        if len(nums) != 2 or not nums[0].isdigit() or amount is None:
+            await update.effective_message.reply_text("Usage: /total <order no.> <new total>, e.g. /total 14 80")
+            return
+        d = pl.retotal_draft(self.store, int(nums[0]), amount)
+        if isinstance(d, str):
+            await update.effective_message.reply_text(d)
+            return
+        draft_id = self.store.draft_add("retotal", d)
+        await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                        reply_markup=markup(pl.draft_buttons(draft_id, d)))
+
     async def cmd_merge(self, update: Update, ctx):
         if not self.authorized(update):
             return
@@ -261,6 +278,20 @@ class BotApp:
             file_id = msg.document.file_id
         if not text and not file_id:
             return
+        pending = self.store.get_setting("edit_total")
+        if pending and msg.forward_origin is None and not file_id:
+            self.store.set_setting("edit_total", "")
+            info = json.loads(pending)
+            amount = pl.parse_amount(text)
+            row = self.store.draft_get(info["draft_id"])
+            if amount is not None and row and row["status"] == "pending":
+                d = pl.set_draft_total(self.store, info["draft_id"], amount)
+                await self.app.bot.edit_message_text(
+                    chat_id=info["chat_id"], message_id=info["message_id"],
+                    text=pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                    reply_markup=markup(pl.draft_buttons(info["draft_id"], d)))
+                await msg.reply_text(f"✅ Total set to {pl.money(amount, self.cfg.currency)}. Tap Confirm on the order above.")
+                return
         origin = msg.forward_origin
         when = origin.date if origin is not None else msg.date
         fingerprint = None
@@ -289,6 +320,12 @@ class BotApp:
             return
         cur, tz = self.cfg.currency, self.cfg.tz
         d = row["data"]
+        if action == "e":  # ✏️ Edit total: the next number you send becomes the total
+            self.store.set_setting("edit_total", json.dumps(
+                {"draft_id": draft_id, "chat_id": q.message.chat_id, "message_id": q.message.message_id}))
+            await self.send(q.message.chat_id, "✏️ Send the correct total as a number, e.g. 80 or 80.00. "
+                                               "(Anything else cancels the edit.)")
+            return
         if action == "o":  # tick/untick an order on a payment
             d = pl.toggle_payment_order(self.store, draft_id, int(rest[1]))
             await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
@@ -370,6 +407,7 @@ class BotApp:
                 ("pending_photos", "What hasn't arrived yet, with photos"),
                 ("status", "Everything I'm still awaiting (tap # for photos)"),
                 ("all", "Every order and its status at a glance"),
+                ("total", "Correct an order's total"),
                 ("merge", "Fold a second-payment order into the original"),
                 ("settle", "Close an order whose payments don't match its total"),
                 ("delivered", "Arrived with the seller, not yet with me"),
@@ -389,7 +427,7 @@ class BotApp:
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
                          ("status", self.cmd_status), ("delivered", self.cmd_delivered),
-                         ("received", self.cmd_received), ("all", self.cmd_all), ("settle", self.cmd_settle), ("merge", self.cmd_merge)]:
+                         ("received", self.cmd_received), ("all", self.cmd_all), ("settle", self.cmd_settle), ("merge", self.cmd_merge), ("total", self.cmd_total)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(

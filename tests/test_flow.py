@@ -659,3 +659,31 @@ def test_merge_existing_order_into_original_and_undo(env):
     assert store.one("SELECT id FROM orders WHERE id=?", (extra,)) is not None
     assert store.one("SELECT total_due, topup FROM orders WHERE id=1")["total_due"] == total1
     assert pl.merge_draft(store, 1, 1) == "Pick two different orders."
+
+
+def test_manual_total_on_draft_and_on_saved_order(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    order = {"kind": "order_confirmation", "summary": "o", "title": "CHOPSTICKS VER", "total_due": 80.0,
+             "items": [{"name": n, "qty": 1, "line_total": 54.5} for n in ("SEONGHWA", "JONGHO", "YEOSANG", "MINGI")]}
+    out = ingest(store, FakeParser(order), cfg, text="o", when=now)
+    d = out["draft"]
+    assert any(w.startswith("Items add up") for w in d["warnings"])
+    assert ("✏️ Edit total", f"e:{out['draft_id']}") in [b for row in pl.draft_buttons(out["draft_id"], d) for b in row]
+    assert pl.parse_amount("S$ 72.5") == 72.5 and pl.parse_amount("hello") is None and pl.parse_amount("80") == 80.0
+    d = pl.set_draft_total(store, out["draft_id"], 72.5)
+    assert d["total_due"] == 72.5 and not any(w.startswith("Items add up") for w in d["warnings"])
+    assert "Total: S$72.50" in pl.render_draft(d, "S$", TZ)
+    confirm(store, out, cfg)
+    assert "S$72.50 across 1 payment(s)" in pl.spent_text(store, cfg, None, None)        # assumed payment follows the total
+
+    # change a saved order afterwards; the assumed payment follows, and /undo restores everything
+    oid = store.one("SELECT MAX(id) m FROM orders")["m"]
+    rd = pl.retotal_draft(store, oid, 70.0)
+    assert "72.50 → S$70.00" in pl.render_draft(rd, "S$", TZ) or "S$72.50 → S$70.00" in pl.render_draft(rd, "S$", TZ)
+    assert "now S$70.00" in pl.apply_draft(store, store.draft_add("retotal", rd), "S$", TZ)
+    assert "S$70.00 across 1 payment(s)" in pl.spent_text(store, cfg, None, None)
+    assert "Nothing owing" in pl.owing_text(store, cfg)
+    assert "back to 72.50" in pl.undo_last(store)
+    assert "S$72.50 across 1 payment(s)" in pl.spent_text(store, cfg, None, None)
+    assert pl.retotal_draft(store, 999, 5) == "I can't find order 999."

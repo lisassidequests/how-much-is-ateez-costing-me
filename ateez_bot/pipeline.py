@@ -156,6 +156,39 @@ def toggle_payment_order(store: Store, draft_id: int, order_id: int) -> dict:
     return d
 
 
+AMOUNT_RE = re.compile(r"^\s*(?:s?\$)?\s*(\d+(?:\.\d{1,2})?)\s*$", re.I)
+
+
+def parse_amount(text: str | None) -> float | None:
+    m = AMOUNT_RE.match(text or "")
+    return float(m.group(1)) if m else None
+
+
+def set_draft_total(store: Store, draft_id: int, amount: float) -> dict:
+    """Manually correct the total of an order draft (or the amount of a second-payment draft) before confirming."""
+    d = store.draft_get(draft_id)["data"]
+    if d["kind"] == "order":
+        d["total_due"] = round(amount, 2)
+    elif d["kind"] == "topup":
+        d["amount"] = round(amount, 2)
+    else:
+        return d
+    d["warnings"] = [w for w in d.get("warnings", []) if not w.startswith("Items add up")]
+    d["note"] = (d.get("note") + "; " if d.get("note") else "") + "total set manually" if d["kind"] == "order" else d.get("note")
+    store.draft_update(draft_id, data=d)
+    return d
+
+
+def retotal_draft(store: Store, order_id: int, new_total: float) -> dict | str:
+    o = {r["id"]: r for r in store.orders_with_balance()}.get(order_id)
+    if not o:
+        return f"I can't find order {order_id}."
+    if abs(o["total_due"] - new_total) <= TOL:
+        return f"Order {order_id} already has that total."
+    return {"kind": "retotal", "order_id": order_id, "title": o["title"][:55], "old_total": o["total_due"],
+            "new_total": round(new_total, 2), "paid": o["paid"], "has_real": o["real_paid"] > TOL}
+
+
 def find_topup_targets(store: Store, title: str, items: list[dict]) -> list:
     """Earlier orders a second payment could belong to: same product, not already topped up, oldest first.
     If the message lists items, prefer orders with exactly those items."""
@@ -359,6 +392,11 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
         return (f"➕ Second payment {money(d['amount'], cur)} for Order {d['order_id']}{tag}: {d['title'][:50]}\n"
                 f"Added to that item's cost: {money(d['old_total'], cur)} → {money(d['old_total'] + d['amount'], cur)}. "
                 f"Counted as paid; no new items or statuses.{warn}")
+    if k == "retotal":
+        gap = ("Your payments stay as they are, so the difference will show as owing/overpaid (use /settle to close it)."
+               if d["has_real"] else "The automatic 'paid in full' record is updated to match.")
+        return (f"✏️ Change Order {d['order_id']} total: {money(d['old_total'], cur)} → {money(d['new_total'], cur)}\n"
+                f"{d['title']}\n{gap} /undo reverses it.")
     if k == "merge":
         return (f"🧩 Merge Order {d['from_id']} into Order {d['into_id']}?\n"
                 f"Order {d['from_id']} ({money(d['amount'], cur)}, {d['n_items']} item(s)) becomes a second payment on "
@@ -424,8 +462,9 @@ def draft_buttons(draft_id: int, d: dict) -> list[list[tuple[str, str]]]:
         rows.append([("✅ Confirm", f"c:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")])
         return rows
     rows = [[("✅ Confirm", f"c:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")]]
-    if d["kind"] == "order" and d.get("candidates"):
-        rows.append([("🔗 Change link", f"m:{draft_id}")])
+    if d["kind"] in ("order", "topup"):
+        rows.append([("✏️ Edit total", f"e:{draft_id}")] + (
+            [("🔗 Change link", f"m:{draft_id}")] if d["kind"] == "order" and d.get("candidates") else []))
     return rows
 
 
@@ -494,6 +533,26 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
         store.add_allocation(pid, d["order_id"], d["amount"])
         result = {"type": "topup", "order_id": d["order_id"], "amount": d["amount"], "payment_id": pid}
         text = f"✅ Added {money(d['amount'], cur)} to Order {d['order_id']}'s cost, counted as paid."
+    elif k == "retotal":
+        oid = d["order_id"]
+        o = store.one("SELECT total_due FROM orders WHERE id=?", (oid,))
+        if not o:
+            raise ValueError("That order no longer exists.")
+        old_assumed = [dict(r) for r in store.assumed_payments_for([oid])]
+        new_pid = None
+        store.run("UPDATE orders SET total_due=? WHERE id=?", (d["new_total"], oid))
+        real = store.one("SELECT COALESCE(SUM(a.amount),0) s FROM allocations a JOIN payments p ON p.id=a.payment_id "
+                         "WHERE a.order_id=? AND p.assumed=0", (oid,))["s"]
+        if old_assumed:  # keep the "counted as paid" record in step with the new total
+            first = min(r["paid_at"] for r in old_assumed)
+            for r in old_assumed:
+                store.run("DELETE FROM payments WHERE id=?", (r["id"],))
+            if d["new_total"] - real > TOL:
+                new_pid = store.add_payment(round(d["new_total"] - real, 2), first, "assumed from order", assumed=True)
+                store.add_allocation(new_pid, oid, round(d["new_total"] - real, 2))
+        result = {"type": "retotal", "order_id": oid, "old_total": o["total_due"], "old_assumed": old_assumed,
+                  "new_payment_id": new_pid}
+        text = f"✅ Order {oid} total is now {money(d['new_total'], cur)}."
     elif k == "merge":
         src = store.one("SELECT * FROM orders WHERE id=?", (d["from_id"],))
         dst = store.one("SELECT id FROM orders WHERE id=?", (d["into_id"],))
@@ -568,6 +627,14 @@ def undo_last(store: Store) -> str:
         store.run("UPDATE orders SET total_due=total_due-?, topup=topup-? WHERE id=?",
                   (r["amount"], r["amount"], r["order_id"]))
         msg = f"Removed the second payment from order {r['order_id']}."
+    elif r["type"] == "retotal":
+        if r.get("new_payment_id"):
+            store.run("DELETE FROM payments WHERE id=?", (r["new_payment_id"],))
+        for a in r["old_assumed"]:
+            pid = store.add_payment(a["amount"], a["paid_at"], a["reference"], assumed=True)
+            store.add_allocation(pid, r["order_id"], a["amount"])
+        store.run("UPDATE orders SET total_due=? WHERE id=?", (r["old_total"], r["order_id"]))
+        msg = f"Order {r['order_id']} total is back to {r['old_total']:.2f}."
     elif r["type"] == "merge":
         snap = r["snapshot"]
         o = snap["order"]
