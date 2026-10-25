@@ -671,7 +671,10 @@ def test_manual_total_on_draft_and_on_saved_order(env):
     assert any(w.startswith("Items add up") for w in d["warnings"])
     assert ("✏️ Edit total", f"e:{out['draft_id']}") in [b for row in pl.draft_buttons(out["draft_id"], d) for b in row]
     assert pl.parse_amount("S$ 72.5") == 72.5 and pl.parse_amount("hello") is None and pl.parse_amount("80") == 80.0
+    labels = [b[0] for row in pl.draft_buttons(out["draft_id"], d) for b in row]
+    assert "🧮 Use items total (218.00)" in labels
     d = pl.set_draft_total(store, out["draft_id"], 72.5)
+    assert not any("Use items total" in b[0] for row in pl.draft_buttons(out["draft_id"], d) for b in row)
     assert d["total_due"] == 72.5 and not any(w.startswith("Items add up") for w in d["warnings"])
     assert "Total: S$72.50" in pl.render_draft(d, "S$", TZ)
     confirm(store, out, cfg)

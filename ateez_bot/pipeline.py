@@ -465,6 +465,8 @@ def draft_buttons(draft_id: int, d: dict) -> list[list[tuple[str, str]]]:
     if d["kind"] in ("order", "topup"):
         rows.append([("✏️ Edit total", f"e:{draft_id}")] + (
             [("🔗 Change link", f"m:{draft_id}")] if d["kind"] == "order" and d.get("candidates") else []))
+        if d["kind"] == "order" and any(w.startswith("Items add up") for w in d.get("warnings", [])):
+            rows.append([(f"🧮 Use items total ({sum(i['line_total'] for i in d['items']):.2f})", f"u:{draft_id}")])
     return rows
 
 

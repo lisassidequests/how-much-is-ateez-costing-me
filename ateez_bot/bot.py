@@ -326,6 +326,10 @@ class BotApp:
             await self.send(q.message.chat_id, "✏️ Send the correct total as a number, e.g. 80 or 80.00. "
                                                "(Anything else cancels the edit.)")
             return
+        if action == "u" and d["kind"] == "order":  # 🧮 use the sum of the item prices as the total
+            d = pl.set_draft_total(self.store, draft_id, round(sum(i["line_total"] for i in d["items"]), 2))
+            await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
+            return
         if action == "o":  # tick/untick an order on a payment
             d = pl.toggle_payment_order(self.store, draft_id, int(rest[1]))
             await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
