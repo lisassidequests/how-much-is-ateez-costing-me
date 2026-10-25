@@ -330,6 +330,10 @@ class BotApp:
             d = pl.set_draft_total(self.store, draft_id, round(sum(i["line_total"] for i in d["items"]), 2))
             await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
             return
+        if action == "k" and d["kind"] == "topup":  # picked the order a second payment belongs to
+            d = pl.choose_topup_order(self.store, draft_id, int(rest[1]))
+            await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))
+            return
         if action == "o":  # tick/untick an order on a payment
             d = pl.toggle_payment_order(self.store, draft_id, int(rest[1]))
             await q.edit_message_text(pl.render_draft(d, cur, tz), reply_markup=markup(pl.draft_buttons(draft_id, d)))

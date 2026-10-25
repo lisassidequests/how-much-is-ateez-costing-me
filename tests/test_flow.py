@@ -690,3 +690,23 @@ def test_manual_total_on_draft_and_on_saved_order(env):
     assert "back to 72.50" in pl.undo_last(store)
     assert "S$72.50 across 1 payment(s)" in pl.spent_text(store, cfg, None, None)
     assert pl.retotal_draft(store, 999, 5) == "I can't find order 999."
+
+
+def test_second_payment_with_unmatched_title_lets_you_pick_the_order(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    first = {"kind": "order_confirmation", "summary": "o", "title": "INSTOCKS - ATEEZ ANITEEZ IN DEJAVU OFFLINE HTB EXTRA 50K BENEFIT PCS",
+             "total_due": 15.5, "items": [{"name": "MINGI", "qty": 1, "line_total": 7.5}, {"name": "HONGJOONG", "qty": 1, "line_total": 8.0}]}
+    # second payment forwarded before the first order exists: nothing to attach to yet
+    second = {"kind": "order_confirmation", "summary": "2nd", "title": "ATEEZ ANITEEZ IN DEJAVU SEOUL POP-UP OFFLINE HTB",
+              "total_due": 0.8, "is_second_payment": True, "items": []}
+    assert ingest(store, FakeParser(second), cfg, text="2nd")["type"] == "info"
+    confirm(store, ingest(store, FakeParser(first), cfg, text="first", when=now), cfg)
+    out = ingest(store, FakeParser(second), cfg, text="2nd again")
+    d = out["draft"]
+    assert d["kind"] == "topup" and d["order_id"] is None and d["candidates"][0]["id"] == 1
+    btns = [b for row in pl.draft_buttons(out["draft_id"], d) for b in row]
+    assert btns[0][1] == f"k:{out['draft_id']}:1" and not any("Confirm" in b[0] for b in btns)
+    d = pl.choose_topup_order(store, out["draft_id"], 1)
+    assert "Added to that item's cost: S$15.50 → S$16.30" in pl.render_draft(d, "S$", TZ)
+    assert "Added S$0.80 to Order 1" in pl.apply_draft(store, out["draft_id"], "S$", TZ)

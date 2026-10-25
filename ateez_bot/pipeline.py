@@ -247,10 +247,16 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                                     "Cancel if it belongs to another.")
                 return {"kind": "topup", "order_id": o["id"], "title": o["title"], "tag": tag["tag"] if tag else None,
                         "amount": total, "old_total": o["total_due"], "paid_at": msg_dt.isoformat(), "warnings": warnings}
-            if not items:
-                return {"kind": "unreadable", "reason": "This looks like a second payment, but I can't find the first "
-                        "order for it. Forward the original order message first."}
-            warnings.append("This looks like a second payment but I couldn't find the first order, so it is shown as a new order.")
+            orders = store.orders_with_balance()
+            if not orders:
+                return {"kind": "unreadable", "reason": "This looks like a second payment, but no order is saved yet. "
+                        "Forward the original order message first, then this one again."}
+            # names differ between her messages, so let the user pick the order (closest titles first)
+            ranked = sorted(orders, key=lambda o: (-sim(title, o["title"]), -o["id"]))[:6]
+            return {"kind": "topup", "order_id": None, "title": title, "tag": None, "amount": total, "old_total": None,
+                    "paid_at": msg_dt.isoformat(),
+                    "candidates": [{"id": o["id"], "label": f"Order {o['id']}: {o['title'][:40]}"} for o in ranked],
+                    "warnings": ["I couldn't match this to an order automatically. Pick the order it belongs to."]}
         if total is None or not items:
             return {"kind": "unreadable", "reason": "I couldn't read the items or total from this order message."}
         if abs(item_sum - total) > TOL:
@@ -387,6 +393,9 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
             lines += [f"{'☑️' if it['id'] in sel else '☐'} {it['name']} ×{it['qty']} "
                       f"(arrived {fmt_date(it['arrived_at'], tz)})" for it in its]
         return "\n".join(lines)
+    if k == "topup" and d.get("order_id") is None:
+        return (f"➕ Second payment {money(d['amount'], cur)} for: {d['title'][:60]}\n"
+                f"Which order is it for?{warn}")
     if k == "topup":
         tag = f" (#{d['tag']})" if d.get("tag") else ""
         return (f"➕ Second payment {money(d['amount'], cur)} for Order {d['order_id']}{tag}: {d['title'][:50]}\n"
@@ -454,6 +463,10 @@ def draft_buttons(draft_id: int, d: dict) -> list[list[tuple[str, str]]]:
         rows.append([("☐ Clear all" if all_sel else "☑️ Select all", f"ra:{draft_id}")])
         rows.append([(f"✅ Confirm ({len(sel)})", f"rc:{draft_id}"), ("✖️ Cancel", f"x:{draft_id}")])
         return rows
+    if d["kind"] == "topup" and d.get("order_id") is None:  # pick the order this second payment belongs to
+        rows = [[(c["label"][:55], f"k:{draft_id}:{c['id']}")] for c in d["candidates"]]
+        rows.append([("✖️ Cancel", f"x:{draft_id}")])
+        return rows
     if d["kind"] == "payment":  # tick the orders this payment covers
         sel = set(d["selected"])
         marks = [(f"{'☑️' if c['id'] in sel else '☐'} Order {c['id']} · {c['owes']:.2f}", f"o:{draft_id}:{c['id']}")
@@ -474,6 +487,17 @@ def candidate_buttons(draft_id: int, d: dict) -> list[list[tuple[str, str]]]:
     rows = [[(c["label"][:55], f"s:{draft_id}:{i}")] for i, c in enumerate(d.get("candidates", []))]
     rows.append([("None of these", f"s:{draft_id}:-1")])
     return rows
+
+
+def choose_topup_order(store: Store, draft_id: int, order_id: int) -> dict:
+    d = store.draft_get(draft_id)["data"]
+    o = {r["id"]: r for r in store.orders_with_balance()}.get(order_id)
+    if o and d["kind"] == "topup":
+        tag = store.one("SELECT p.tag FROM posts p JOIN orders x ON x.post_id=p.id WHERE x.id=?", (order_id,))
+        d.update(order_id=order_id, title=o["title"], tag=tag["tag"] if tag else None, old_total=o["total_due"],
+                 warnings=[])
+        store.draft_update(draft_id, data=d)
+    return d
 
 
 def select_candidate(store: Store, draft_id: int, idx: int) -> dict:
