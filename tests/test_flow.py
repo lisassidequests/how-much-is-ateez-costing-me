@@ -62,7 +62,7 @@ ORDER_P5 = {"kind": "order_confirmation", "summary": "order",
             "total_due": 114.0, "note": "first payment, pending second payment",
             "matched_tag": "anghp5_2", "match_confidence": "high"}
 ORDER_DEJAVU = {"kind": "order_confirmation", "summary": "order",
-                "title": "INSTOCKS - ATEEZ ANITEEZ IN DEJAVU OFFLINE HTB EXTRA 50K BENEFIT PCS",
+                "title": "ATEEZ ANITEEZ IN DEJAVU OFFLINE HTB EXTRA 50K BENEFIT PCS",
                 "items": [{"name": "MINGI", "qty": 1, "line_total": 7.5},
                           {"name": "HONGJOONG", "qty": 1, "line_total": 8.0}],
                 "total_due": 15.5, "matched_tag": None, "match_confidence": None}
@@ -710,3 +710,26 @@ def test_second_payment_with_unmatched_title_lets_you_pick_the_order(env):
     d = pl.choose_topup_order(store, out["draft_id"], 1)
     assert "Added to that item's cost: S$15.50 → S$16.30" in pl.render_draft(d, "S$", TZ)
     assert "Added S$0.80 to Order 1" in pl.apply_draft(store, out["draft_id"], "S$", TZ)
+
+
+def test_instock_post_without_serial_and_order_marked_arrived(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    post = {"kind": "channel_post", "summary": "p", "tag": None,
+            "title": "[INSTOCK] ATEEZ ANITEEZ IN COLOUR SEOUL OFFLINE POP-UP ENTRY EXCLUSIVE UNIT PHOTOCARDS", "price_note": "$50 OTP/pc"}
+    out = ingest(store, FakeParser(post), cfg, text="[INSTOCK] ... $50 OTP/pc", photo="IMG", channel=True)
+    d = out["draft"]
+    assert d["kind"] == "channel_post" and d["tag"].startswith("instock-") and "No serial" in pl.render_draft(d, "S$", TZ)
+    confirm(store, out, cfg)
+    # forwarding it again gives the same tag, so it is flagged as a duplicate instead of creating another post
+    assert ingest(store, FakeParser(post), cfg, text="[INSTOCK] ... $50 OTP/pc (again)", photo="IMG2", channel=True)["draft"]["tag"] == d["tag"]
+
+    # her order DM words the product differently ("PCS", no INSTOCK label) but still links, and is marked arrived at her end
+    order = {"kind": "order_confirmation", "summary": "o", "title": "ATEEZ ANITEEZ IN COLOUR SEOUL OFFLINE POP-UP ENTRY EXCLUSIVE UNIT PCS",
+             "total_due": 100.0, "items": [{"name": "HJ/YH", "qty": 1, "line_total": 50.0}, {"name": "SAN/MINGI", "qty": 1, "line_total": 50.0}]}
+    o = ingest(store, FakeParser(order), cfg, text="order", when=now)
+    assert o["draft"]["post_tag"] == d["tag"] and o["draft"]["instock"] is True
+    assert "marked as arrived at her end" in confirm(store, o, cfg)
+    assert store.one("SELECT COUNT(*) c FROM items WHERE arrived_at IS NOT NULL")["c"] == 2
+    assert pl.received_drafts(store, cfg)[0]["items"][0]["name"] == "HJ/YH"      # ready for /received
+    assert pl.is_instock("INSTOCKS - ATEEZ X") and not pl.is_instock("ATEEZ INSTOCKING")

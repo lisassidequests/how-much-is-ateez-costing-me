@@ -19,6 +19,8 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
    It contains a serial hashtag like #anghp6_4 (return it WITHOUT the '#', lowercase, keeping any hyphens/underscores) and a product
    name, e.g. "[po] #anghp6_4 ateez golden hour pt.6 makestar fansign 1.0 ribbon puppy ver."
    Return tag, title (product name without "[po]" or the tag), price_note (e.g. "$6.50 fp per member").
+   Some posts are labelled [INSTOCK]: the seller already has the item and does not give it a serial. For those
+   return tag = null and title without the "[INSTOCK]" label; never invent a serial.
    The first-person status lines further down (names with check marks) are claim lists; ignore them.
 
 2. order_confirmation - the seller's DM confirming an order. It has NO serial number. Example:

@@ -6,7 +6,7 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 ## What you forward
 | Forward this | Bot does |
 |---|---|
-| Seller's channel post (photo + `#serial`) | Saves the serial, title and photo |
+| Seller's channel post (photo + `#serial`) | Saves the serial, title and photo. `[INSTOCK]` posts have no serial: they're filed under an automatic `#instock-xxxxx` tag |
 | Seller's order confirmation DM (the payment request) | Saves items and total, links to the channel post by product name (asks if unsure), and counts it as paid in full since you pay instantly |
 | Your payment screenshot (optional) | Only needed when you paid a different amount than the request. Replaces the automatic payment for the order(s) it covers (one transfer can pay several); tick them yourself if unsure |
 | Seller's "arrived" update | Marks the items arrived (by `#serial`, and member names if given) |
@@ -14,6 +14,8 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 **Second payments:** when the seller later asks for the second (shipping) payment, forward it like any order message. The bot recognises it, adds the amount to the original order's cost (so it counts under that #tag) and creates no new items or statuses. If an earlier one was saved as its own order, `/merge 5 1` folds order 5 into order 1.
 
 **Wrong total?** Tap ✏️ Edit total on the order before confirming, then send the right number (e.g. `80`). For an order already saved, use `/total 14 80`.
+
+**In-stock items:** the seller already has these on hand, so once you confirm the order they count as arrived at her end and go straight to `/received`; there is no arrival notice to wait for.
 
 **Duplicate check:** if you forward the exact same message twice, or an order or payment that matches one you already saved (same product, items and total / same amount on the same day), the confirmation carries a ⚠️ "Possible duplicate" line. Tap Confirm to save it anyway (for a genuine repeat purchase) or Cancel. If an arrival notice only covers items already marked arrived, the bot just tells you so.
 

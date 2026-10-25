@@ -5,6 +5,7 @@ Nothing here talks to Telegram, so it can be tested without a bot token.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import itertools
 import json
 import re
@@ -24,8 +25,25 @@ def money(x: float, cur: str) -> str:
     return f"{cur}{x:,.2f}"
 
 
+_SKIP_WORDS = {"instock", "instocks", "po"}
+_SYNONYMS = {"photocards": "pcs", "photocard": "pcs", "pc": "pcs"}
+
+
 def _tokens(s: str | None) -> list[str]:
-    return re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).split()
+    """Words for fuzzy title matching. 'INSTOCK'/'[PO]' labels are dropped and photocard/pcs wording is unified,
+    because the seller words the same product differently in her post and in her order DM."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).split()
+    return [_SYNONYMS.get(w, w) for w in words if w not in _SKIP_WORDS]
+
+
+def is_instock(*texts: str | None) -> bool:
+    return any(re.search(r"\binstocks?\b", t or "", re.I) for t in texts)
+
+
+def synthetic_tag(title: str, raw_text: str | None) -> str:
+    """In-stock posts have no #serial: make a stable one from the title (re-forwarding gives the same tag)."""
+    h = hashlib.sha1(" ".join(_tokens(title)).encode()).hexdigest()[:5]
+    return f"{'instock' if is_instock(title, raw_text) else 'post'}-{h}"
 
 
 def sim(a: str | None, b: str | None) -> float:
@@ -113,6 +131,9 @@ def relink_orders(store: Store) -> int:
             continue  # ambiguous between two similar posts: leave it for the user
         store.run("UPDATE orders SET post_id=? WHERE id=?", (scored[0][1]["id"], o["id"]))
         store.run("UPDATE items SET post_id=? WHERE order_id=?", (scored[0][1]["id"], o["id"]))
+        if scored[0][1]["tag"].startswith("instock-"):
+            store.run("UPDATE items SET arrived_at=COALESCE(arrived_at,(SELECT ordered_at FROM orders WHERE id=?)) "
+                      "WHERE order_id=?", (o["id"], o["id"]))
         n += 1
     return n
 
@@ -215,9 +236,12 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
 
     if kind == "channel_post":
         tag = (parsed.get("tag") or fallback_tag(ctx.get("raw_text")) or "").lstrip("#").lower()
-        if not tag:
-            return {"kind": "unreadable", "reason": "This looks like a channel post but I couldn't find its #serial."}
         title = parsed.get("title") or (ctx.get("raw_text") or "").split("\n")[0][:120] or tag
+        no_serial = not tag
+        if no_serial:
+            if not title:
+                return {"kind": "unreadable", "reason": "This looks like a channel post but I couldn't find its title or #serial."}
+            tag = synthetic_tag(title, ctx.get("raw_text"))
         fid = ctx.get("image_file_id")
         exists = store.get_post_by_tag(tag) is not None
         return {"kind": "channel_post", "tag": tag, "title": title, "price_note": parsed.get("price_note"),
@@ -225,7 +249,10 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                 "raw_text": ctx.get("raw_text"), "posted_at": msg_dt.isoformat(),
                 "exists": exists,
                 "warnings": ([f"Possible duplicate: #{tag} is already saved. Confirm to update it, or Cancel."]
-                             if exists else [])}
+                             if exists else [])
+                            + ([f"No serial on this post ({'in-stock item' if tag.startswith('instock') else 'unusual'}), "
+                                f"so I'm filing it as #{tag}. Orders are matched to it by product name."]
+                               if no_serial else [])}
 
     if kind == "order_confirmation":
         items = [{"name": clean_name(i["name"]), "qty": int(i.get("qty") or 1),
@@ -275,7 +302,8 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                 post = best
         if post is not None:
             post_id, post_tag = post["id"], post["tag"]
-        return {"kind": "order", "title": title, "items": items, "total_due": total,
+        instock = is_instock(title) or (post is not None and post["tag"].startswith("instock-"))
+        return {"kind": "order", "instock": instock, "title": title, "items": items, "total_due": total,
                 "mailing_fee": parsed.get("mailing_fee"), "note": parsed.get("note"),
                 "post_id": post_id, "post_tag": post_tag, "candidates": cands,
                 "ordered_at": msg_dt.isoformat(), "raw_text": ctx.get("raw_text"), "warnings": warnings}
@@ -427,10 +455,12 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
                 else "🔗 Not linked to a channel post (tap Change link to pick one)")
         fee = f"\nMailing fee: {money(d['mailing_fee'], cur)}" if d.get("mailing_fee") else ""
         note = f"\nNote: {d['note']}" if d.get("note") else ""
+        stock = ("\n📦 In stock with the seller: I'll mark it as arrived at her end. Use /received when it reaches you."
+                 if d.get("instock") else "")
         paid = (f"\n💸 Counted as paid in full ({money(d['total_due'], cur)}). No screenshot needed unless "
                 "what you actually paid differs." if d.get("total_due", 0) > 0 else "")
         return (f"🛒 Order: {d['title']}\n{lines}{fee}\nTotal: {money(d['total_due'], cur)}{note}\n"
-                f"{link}\nOrdered: {fmt_date(d['ordered_at'], tz)}{paid}{warn}")
+                f"{link}\nOrdered: {fmt_date(d['ordered_at'], tz)}{stock}{paid}{warn}")
     if k == "payment":
         ref = f"\nRef: {d['reference']}" if d.get("reference") else ""
         plan = d.get("plan", [])
@@ -527,6 +557,9 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
                                         d.get("note"), d["ordered_at"], d.get("raw_text"), d["items"])
         result = {"type": "order", "order_id": oid, "item_ids": item_ids}
         text = f"✅ Order {oid} saved: {len(item_ids)} item(s), {money(d['total_due'], cur)}."
+        if d.get("instock"):  # she already has it, so there is no arrival to wait for at her end
+            store.mark_arrived(item_ids, d["ordered_at"])
+            text += "\n📦 In stock with the seller, so marked as arrived at her end. Use /received when it reaches you."
         if d["total_due"] > 0:  # you pay instantly, so a payment request counts as paid
             pid = store.add_payment(d["total_due"], d["ordered_at"], "assumed from order", assumed=True)
             store.add_allocation(pid, oid, d["total_due"])
