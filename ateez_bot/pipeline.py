@@ -796,6 +796,7 @@ def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str |
     def ok(r):
         return keyword_ok(keyword, r["name"], r["order_title"], r["post_title"], r["tag"])
     pending = [r for r in store.items_pending() if ok(r)] if mode == "expecting" else []
+    SELLER_WAIT_DAYS = 14   # at the seller this long without reaching you: worth a nudge
     at_seller = [r for r in store.items_arrived(unreceived_only=True) if ok(r)]
     if not pending and not at_seller:
         return []
@@ -821,6 +822,12 @@ def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str |
         late = sum(1 for b in waiting if b["age"] >= cfg.late_days)
         if late:
             header += f"\n⚠️ {late} batch(es) past {cfg.late_days // 7} weeks. Maybe ask the seller?"
+    elif mode == "awaiting":
+        stale = sum(1 for b in arrived if (now - to_dt(b["arrived"], cfg.tz)).days >= SELLER_WAIT_DAYS)
+        header = (f"📮 The seller has these and should be sending them to you: {len(at_seller)} item(s) in {len(arrived)} batch(es)\n"
+                  "Use /received when they reach you.")
+        if stale:
+            header += f"\n⚠️ {stale} batch(es) have been with her for {SELLER_WAIT_DAYS}+ days. Maybe ask when she'll ship?"
     else:
         header = (f"📬 Reached the seller, not yet received by you: {len(at_seller)} item(s) in {len(arrived)} batch(es)\n"
                   "Use /received when they reach you." + (f"\n✔️ {got} item(s) already received." if got else ""))
@@ -832,8 +839,13 @@ def overview(store: Store, cfg: Config, now: datetime, mode: str, keyword: str |
             if b["stage"] == "pending":
                 lines.append(f"{'⚠️' if b['age'] >= cfg.late_days else '⏳'} {b['head']}: {', '.join(b['names'])} ({b['age']}d)")
             else:
-                lines.append(f"{'📬' if mode == 'expecting' else '✅'} {b['head']}: {', '.join(b['names'])} "
-                             f"(at seller since {fmt_date(b['arrived'], cfg.tz)})")
+                days = max(0, (now - to_dt(b["arrived"], cfg.tz)).days)
+                if mode == "awaiting":
+                    lines.append(f"{'⚠️' if days >= SELLER_WAIT_DAYS else '📮'} {b['head']}: {', '.join(b['names'])} "
+                                 f"(with her {days}d, since {fmt_date(b['arrived'], cfg.tz)})")
+                else:
+                    lines.append(f"{'📬' if mode == 'expecting' else '✅'} {b['head']}: {', '.join(b['names'])} "
+                                 f"(at seller since {fmt_date(b['arrived'], cfg.tz)})")
         buttons = [(f"#{b['tag']}", f"t:{b['post_id']}") for b in chunk if b["post_id"]]
         if buttons:
             lines.append("\nTap a # below to see the photos.")
@@ -1014,10 +1026,11 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return [{"text": owing_text(store, cfg, kw)}]
     if intent == "all":
         return all_orders(store, cfg, now, kw) or [{"text": "No orders saved yet."}]
-    if intent in ("status", "delivered"):
-        mode = "expecting" if intent == "status" else "delivered"
-        return overview(store, cfg, now, mode, kw) or [{"text": "🎉 Nothing pending." if intent == "status"
-                                                         else "Nothing is waiting to reach you."}]
+    if intent in ("status", "delivered", "awaiting"):
+        mode = {"status": "expecting", "delivered": "delivered", "awaiting": "awaiting"}[intent]
+        empty = {"status": "🎉 Nothing pending.", "delivered": "Nothing is waiting to reach you.",
+                 "awaiting": "Nothing for the seller to send you right now."}[intent]
+        return overview(store, cfg, now, mode, kw) or [{"text": empty}]
     if intent == "pending":  # compact text list of everything not arrived, late or not
         chunks = weekly_digest(store, cfg, now, kw)
         return [{"text": c} for c in chunks] or [{"text": "🎉 Nothing pending."}]
@@ -1030,7 +1043,7 @@ def answer_question(store: Store, cfg: Config, parsed: dict, now: datetime) -> l
         return cap_messages(pending_messages(store, cfg, now, rows))
     return [{"text": "To mark items as arrived, forward me the seller's arrival update and tap Confirm. "
                      "When they reach you, use /received.\n\n"
-                     "Other commands: /status, /all, /delivered, /settle, /merge, /pending, /late, /spent, /owing, /undo, /healthcheck. "
+                     "Other commands: /status, /awaiting, /all, /delivered, /settle, /merge, /pending, /late, /spent, /owing, /undo, /healthcheck. "
                      "Or ask about spending, pending or late items in plain words."}]
 
 

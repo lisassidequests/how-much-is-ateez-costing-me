@@ -733,3 +733,17 @@ def test_instock_post_without_serial_and_order_marked_arrived(env):
     assert store.one("SELECT COUNT(*) c FROM items WHERE arrived_at IS NOT NULL")["c"] == 2
     assert pl.received_drafts(store, cfg)[0]["items"][0]["name"] == "HJ/YH"      # ready for /received
     assert pl.is_instock("INSTOCKS - ATEEZ X") and not pl.is_instock("ATEEZ INSTOCKING")
+
+
+def test_awaiting_lists_what_the_seller_should_send(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    setup_orders(store, cfg, now)
+    assert pl.answer_question(store, cfg, {"intent": "awaiting"}, now)[0]["text"] == "Nothing for the seller to send you right now."
+    arr = {"kind": "arrival_update", "summary": "x", "tags": ["anghp5_2"], "names": []}
+    confirm(store, ingest(store, FakeParser(arr), cfg, text="#anghp5_2 arrived"), cfg)
+    msg = pl.answer_question(store, cfg, {"intent": "awaiting"}, now)[0]
+    assert "should be sending them to you: 2 item(s)" in msg["text"] and "#anghp5_2" in msg["text"] and "with her 0d" in msg["text"]
+    assert msg["buttons"][0][0][0] == "#anghp5_2"
+    later = now + timedelta(days=20)                       # stale -> nudge
+    assert "⚠️ 1 batch(es) have been with her for 14+ days" in pl.answer_question(store, cfg, {"intent": "awaiting"}, later)[0]["text"]

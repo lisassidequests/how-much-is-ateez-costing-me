@@ -58,7 +58,7 @@ The buyer purchases through a seller's Telegram channel ("ange's ins"). Message 
 
 5. question - the buyer asking about their own records (typed, not forwarded). Return question
    with intent one of: spent, pending (text list), pending_photos (when they ask to see pictures
-   of what's pending), status (everything they're still awaiting, not yet with them), all (every order and its status), delivered (what has arrived at the seller), late, owing; optional month (YYYY-MM) and keyword
+   of what's pending), status (everything they're still awaiting, not yet with them), all (every order and its status), awaiting (what the seller still has to send them), delivered (what has arrived at the seller), late, owing; optional month (YYYY-MM) and keyword
    (e.g. a group, member or product name).
 
 6. other - anything else.
@@ -101,7 +101,7 @@ TOOL = {
                 "required": ["tag"]}},
             "names": {"type": "array", "items": {"type": "string"}},
             "intent": {"type": ["string", "null"],
-                       "enum": ["spent", "pending", "pending_photos", "status", "all", "delivered", "late", "owing", None]},
+                       "enum": ["spent", "pending", "pending_photos", "status", "all", "awaiting", "delivered", "late", "owing", None]},
             "month": {"type": ["string", "null"]},
             "keyword": {"type": ["string", "null"]},
         },

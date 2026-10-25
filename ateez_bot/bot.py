@@ -37,6 +37,7 @@ HELP = (
     "with a button per # for the photos\n"
     "/total <order no.> <amount>: correct a saved order's total (you can also tap ✏️ Edit total on an order before confirming)\n"
     "/merge <extra order no.> <original order no.>: fold an order that was really a second (shipping) payment into the original\n"
+    "/awaiting [name]: what the seller has and should be sending you (with days waiting)\n"
     "/all [name]: every order at a glance: paid or owing, and where each item is\n"
     "/settle [order no.]: close an order whose total and payments don't match, treating what you paid as final\n"
     "/delivered [name]: arrived with the seller but not with you yet (# buttons too)\n"
@@ -179,6 +180,10 @@ class BotApp:
     async def cmd_delivered(self, update: Update, ctx):
         if self.authorized(update):
             await self._reply_report(update, {"intent": "delivered", "keyword": " ".join(ctx.args) or None})
+
+    async def cmd_awaiting(self, update: Update, ctx):
+        if self.authorized(update):
+            await self._reply_report(update, {"intent": "awaiting", "keyword": " ".join(ctx.args) or None})
 
     async def cmd_all(self, update: Update, ctx):
         if self.authorized(update):
@@ -414,6 +419,7 @@ class BotApp:
                 ("pending", "What hasn't arrived yet (text list)"),
                 ("pending_photos", "What hasn't arrived yet, with photos"),
                 ("status", "Everything I'm still awaiting (tap # for photos)"),
+                ("awaiting", "What the seller should be sending me"),
                 ("all", "Every order and its status at a glance"),
                 ("total", "Correct an order's total"),
                 ("merge", "Fold a second-payment order into the original"),
@@ -435,7 +441,7 @@ class BotApp:
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
                          ("status", self.cmd_status), ("delivered", self.cmd_delivered),
-                         ("received", self.cmd_received), ("all", self.cmd_all), ("settle", self.cmd_settle), ("merge", self.cmd_merge), ("total", self.cmd_total)]:
+                         ("received", self.cmd_received), ("all", self.cmd_all), ("awaiting", self.cmd_awaiting), ("settle", self.cmd_settle), ("merge", self.cmd_merge), ("total", self.cmd_total)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(
