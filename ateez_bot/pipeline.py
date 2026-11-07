@@ -243,12 +243,17 @@ def build_draft(store: Store, parsed: dict, ctx: dict, tz: ZoneInfo) -> dict:
                 return {"kind": "unreadable", "reason": "This looks like a channel post but I couldn't find its title or #serial."}
             tag = synthetic_tag(title, ctx.get("raw_text"))
         fid = ctx.get("image_file_id")
-        exists = store.get_post_by_tag(tag) is not None
+        old_post = store.get_post_by_tag(tag)
+        exists = old_post is not None
+        reused = exists and sim(old_post["title"], title) < 0.6   # same code, clearly a different product
         return {"kind": "channel_post", "tag": tag, "title": title, "price_note": parsed.get("price_note"),
                 "image_file_ids": [fid] if fid else [], "media_group_id": ctx.get("media_group_id"),
                 "raw_text": ctx.get("raw_text"), "posted_at": msg_dt.isoformat(),
                 "exists": exists,
-                "warnings": ([f"Possible duplicate: #{tag} is already saved. Confirm to update it, or Cancel."]
+                "warnings": ([f"#{tag} is already saved for a different product ({old_post['title'][:50]}). The seller "
+                              f"may have reused the code. Cancel, run /retag {tag} <its new code> for the old one, then "
+                              "forward this again."] if reused else
+                             [f"Possible duplicate: #{tag} is already saved. Confirm to update it, or Cancel."]
                              if exists else [])
                             + ([f"No serial on this post ({'in-stock item' if tag.startswith('instock') else 'unusual'}), "
                                 f"so I'm filing it as #{tag}. Orders are matched to it by product name."]
@@ -421,6 +426,10 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
             lines += [f"{'☑️' if it['id'] in sel else '☐'} {it['name']} ×{it['qty']} "
                       f"(arrived {fmt_date(it['arrived_at'], tz)})" for it in its]
         return "\n".join(lines)
+    if k == "retag":
+        return (f"🏷 Change code #{d['old']} → #{d['new']}\n{d['title']}\n"
+                f"{d['n_items']} item(s) stay attached. Arrival notices will now need #{d['new']}, and #{d['old']} "
+                "is free for another purchase. /undo reverses it.")
     if k == "topup" and d.get("order_id") is None:
         return (f"➕ Second payment {money(d['amount'], cur)} for: {d['title'][:60]}\n"
                 f"Which order is it for?{warn}")
@@ -592,6 +601,12 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
         store.add_allocation(pid, d["order_id"], d["amount"])
         result = {"type": "topup", "order_id": d["order_id"], "amount": d["amount"], "payment_id": pid}
         text = f"✅ Added {money(d['amount'], cur)} to Order {d['order_id']}'s cost, counted as paid."
+    elif k == "retag":
+        if store.find_post_by_tag(d["new"]):
+            raise ValueError(f"#{d['new']} is already used by another post.")
+        store.run("UPDATE posts SET tag=? WHERE id=?", (d["new"], d["post_id"]))
+        result = {"type": "retag", "post_id": d["post_id"], "old": d["old"], "new": d["new"]}
+        text = f"✅ #{d['old']} is now #{d['new']}. #{d['old']} is free for a new post."
     elif k == "retotal":
         oid = d["order_id"]
         o = store.one("SELECT total_due FROM orders WHERE id=?", (oid,))
@@ -686,6 +701,12 @@ def undo_last(store: Store) -> str:
         store.run("UPDATE orders SET total_due=total_due-?, topup=topup-? WHERE id=?",
                   (r["amount"], r["amount"], r["order_id"]))
         msg = f"Removed the second payment from order {r['order_id']}."
+    elif r["type"] == "retag":
+        if store.get_post_by_tag(r["old"]):
+            msg = f"Couldn't restore #{r['old']}: another post uses it now."
+        else:
+            store.run("UPDATE posts SET tag=? WHERE id=?", (r["old"], r["post_id"]))
+            msg = f"Code is back to #{r['old']}."
     elif r["type"] == "retotal":
         if r.get("new_payment_id"):
             store.run("DELETE FROM payments WHERE id=?", (r["new_payment_id"],))
@@ -898,6 +919,24 @@ def all_orders(store: Store, cfg: Config, now: datetime, keyword: str | None = N
     header = f"🗂 {len(orders)} order(s), {done} fully received. Oldest first."
     return [{"text": "\n\n".join([header if i == 0 else "(continued)"] + blocks[i:i + ALL_PER_MESSAGE])}
             for i in range(0, len(blocks), ALL_PER_MESSAGE)]
+
+
+def retag_draft(store: Store, old: str, new: str) -> dict | str:
+    """Rename a saved post's serial (the seller changed the code, or reused the old one for another product)."""
+    old = old.lstrip("#").lower()
+    new = new.lstrip("#").lower()
+    post = store.find_post_by_tag(old)
+    if not post:
+        return f"I don't have a post tagged #{old}. Check /all or /status for the exact code."
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_\-]*", new):
+        return "A code uses letters, numbers, _ and - only, e.g. anghp6_8b."
+    if new == post["tag"]:
+        return f"#{new} is already that post's code."
+    if store.find_post_by_tag(new):
+        return f"#{new} is already used by another post. Pick a different code."
+    n = store.one("SELECT COUNT(*) c FROM items WHERE post_id=?", (post["id"],))["c"]
+    return {"kind": "retag", "post_id": post["id"], "old": post["tag"], "new": new,
+            "title": post["title"][:70], "n_items": n}
 
 
 def merge_draft(store: Store, from_id: int, into_id: int) -> dict | str:

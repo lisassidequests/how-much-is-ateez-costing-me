@@ -747,3 +747,35 @@ def test_awaiting_lists_what_the_seller_should_send(env):
     assert msg["buttons"][0][0][0] == "#anghp5_2"
     later = now + timedelta(days=20)                       # stale -> nudge
     assert "⚠️ 1 batch(es) have been with her for 14+ days" in pl.answer_question(store, cfg, {"intent": "awaiting"}, later)[0]["text"]
+
+
+def test_retag_when_seller_reuses_a_code(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    old = {"kind": "channel_post", "summary": "p", "tag": "anghp6_8", "title": "ateez golden hour pt.6 beatroad fansign & 1:1 video call event"}
+    confirm(store, ingest(store, FakeParser(old), cfg, text="#anghp6_8 beatroad", photo="A", channel=True), cfg)
+    order = {"kind": "order_confirmation", "summary": "o", "title": old["title"], "total_due": 20.0,
+             "items": [{"name": "OT8", "qty": 8, "line_total": 20.0}]}
+    confirm(store, ingest(store, FakeParser(order), cfg, text="order", when=now), cfg)
+    assert store.one("SELECT post_id FROM orders WHERE id=1")["post_id"] == 1
+
+    # the same code now appears on a different product: the draft warns instead of silently overwriting
+    new = {"kind": "channel_post", "summary": "p", "tag": "anghp6_8", "title": "ateez 8th anniversary md admin online purchase"}
+    w = ingest(store, FakeParser(new), cfg, text="#anghp6_8 other", photo="B", channel=True)["draft"]["warnings"]
+    assert "may have reused the code" in w[0] and "/retag anghp6_8" in w[0]
+
+    # rename the old one; its order stays attached and arrivals use the new code
+    assert pl.retag_draft(store, "nope", "x").startswith("I don't have a post")
+    assert "letters, numbers" in pl.retag_draft(store, "anghp6_8", "bad code!")
+    assert pl.retag_draft(store, "anghp6_8", "anghp6_8") == "#anghp6_8 is already that post's code."
+    d = pl.retag_draft(store, "#ANGHP6_8", "#anghp6_8b")
+    assert d["old"] == "anghp6_8" and d["new"] == "anghp6_8b" and d["n_items"] == 1
+    assert "#anghp6_8 → #anghp6_8b" in pl.render_draft(d, "S$", TZ)
+    assert "now #anghp6_8b" in pl.apply_draft(store, store.draft_add("retag", d), "S$", TZ)
+    assert store.get_post_by_tag("anghp6_8") is None and store.get_post_by_tag("anghp6_8b")["id"] == 1
+    arr = {"kind": "arrival_update", "summary": "a", "tags": ["anghp6_8b"], "names": []}
+    assert ingest(store, FakeParser(arr), cfg, text="#anghp6_8b arrived")["draft"]["item_ids"] == [1]
+    # the freed code can now be used by the new post, no warning
+    assert not ingest(store, FakeParser(new), cfg, text="#anghp6_8 other again", photo="B2", channel=True)["draft"]["warnings"]
+    # /undo of the rename works while the old code is still free (the new post above was never confirmed)
+    assert "Code is back to #anghp6_8" in pl.undo_last(store)

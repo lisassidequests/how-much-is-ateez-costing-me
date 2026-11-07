@@ -36,6 +36,7 @@ HELP = (
     "/status [name]: everything you're still awaiting (not at the seller yet, or at the seller but not with you), "
     "with a button per # for the photos\n"
     "/total <order no.> <amount>: correct a saved order's total (you can also tap ✏️ Edit total on an order before confirming)\n"
+    "/retag <old code> <new code>: the seller changed a code (or reused it): rename the saved post, e.g. /retag anghp6_8 anghp6_8b\n"
     "/merge <extra order no.> <original order no.>: fold an order that was really a second (shipping) payment into the original\n"
     "/awaiting [name]: what the seller has and should be sending you (with days waiting)\n"
     "/all [name]: every order at a glance: paid or owing, and where each item is\n"
@@ -218,6 +219,22 @@ class BotApp:
             await update.effective_message.reply_text(d)
             return
         draft_id = self.store.draft_add("retotal", d)
+        await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
+                        reply_markup=markup(pl.draft_buttons(draft_id, d)))
+
+    async def cmd_retag(self, update: Update, ctx):
+        if not self.authorized(update):
+            return
+        if len(ctx.args) != 2:
+            await update.effective_message.reply_text(
+                "Usage: /retag <old code> <new code>, e.g. /retag anghp6_8 anghp6_8b\n"
+                "Use the new code the seller gave you (or any short label if she hasn't said).")
+            return
+        d = pl.retag_draft(self.store, ctx.args[0], ctx.args[1])
+        if isinstance(d, str):
+            await update.effective_message.reply_text(d)
+            return
+        draft_id = self.store.draft_add("retag", d)
         await self.send(update.effective_chat.id, pl.render_draft(d, self.cfg.currency, self.cfg.tz),
                         reply_markup=markup(pl.draft_buttons(draft_id, d)))
 
@@ -422,6 +439,7 @@ class BotApp:
                 ("awaiting", "What the seller should be sending me"),
                 ("all", "Every order and its status at a glance"),
                 ("total", "Correct an order's total"),
+                ("retag", "Change a post's code"),
                 ("merge", "Fold a second-payment order into the original"),
                 ("settle", "Close an order whose payments don't match its total"),
                 ("delivered", "Arrived with the seller, not yet with me"),
@@ -441,7 +459,7 @@ class BotApp:
                          ("late", self.cmd_late), ("spent", self.cmd_spent), ("owing", self.cmd_owing),
                          ("undo", self.cmd_undo), ("healthcheck", self.cmd_healthcheck),
                          ("status", self.cmd_status), ("delivered", self.cmd_delivered),
-                         ("received", self.cmd_received), ("all", self.cmd_all), ("awaiting", self.cmd_awaiting), ("settle", self.cmd_settle), ("merge", self.cmd_merge), ("total", self.cmd_total)]:
+                         ("received", self.cmd_received), ("all", self.cmd_all), ("awaiting", self.cmd_awaiting), ("settle", self.cmd_settle), ("merge", self.cmd_merge), ("retag", self.cmd_retag), ("total", self.cmd_total)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(
