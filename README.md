@@ -17,7 +17,7 @@ and what's overdue. You forward messages to it; it reads them with Claude, shows
 
 **In-stock items:** the seller already has these on hand, so once you confirm the order they count as arrived at her end and go straight to `/received`; there is no arrival notice to wait for.
 
-**Seller changed a code?** `/retag anghp6_8 anghp6_8b` renames the saved post (its orders stay attached; later arrival notices should use the new code) and frees the old code for your new purchase. If you forward a post whose code is already saved for a different product, the bot warns you and tells you to do this first.
+**Seller changed a code?** `/retag anghp6_8 anghp6_8b` renames the saved post (its orders stay attached; later arrival notices should use the new code) and frees the old code for your new purchase. If the new code is already saved for the same product (you forwarded the refreshed post first), `/retag` merges the old post into it and moves your items across. If you forward a post whose code is already saved for a different product, the bot warns you and tells you to do this first.
 
 **Duplicate check:** if you forward the exact same message twice, or an order or payment that matches one you already saved (same product, items and total / same amount on the same day), the confirmation carries a ⚠️ "Possible duplicate" line. Tap Confirm to save it anyway (for a genuine repeat purchase) or Cancel. If an arrival notice only covers items already marked arrived, the bot just tells you so.
 

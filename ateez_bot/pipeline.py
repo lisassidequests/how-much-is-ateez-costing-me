@@ -426,6 +426,10 @@ def render_draft(d: dict, cur: str, tz: ZoneInfo) -> str:
             lines += [f"{'☑️' if it['id'] in sel else '☐'} {it['name']} ×{it['qty']} "
                       f"(arrived {fmt_date(it['arrived_at'], tz)})" for it in its]
         return "\n".join(lines)
+    if k == "retag" and d.get("merge_into"):
+        return (f"🏷 #{d['new']} is already saved for the same product, so I'll merge #{d['old']} into it.\n{d['title']}\n"
+                f"{d['n_items']} item(s) move to #{d['new']}, photos are combined and the old #{d['old']} post is removed. "
+                "/undo reverses it.")
     if k == "retag":
         return (f"🏷 Change code #{d['old']} → #{d['new']}\n{d['title']}\n"
                 f"{d['n_items']} item(s) stay attached. Arrival notices will now need #{d['new']}, and #{d['old']} "
@@ -601,6 +605,21 @@ def apply_draft(store: Store, draft_id: int, cur: str, tz: ZoneInfo) -> str:
         store.add_allocation(pid, d["order_id"], d["amount"])
         result = {"type": "topup", "order_id": d["order_id"], "amount": d["amount"], "payment_id": pid}
         text = f"✅ Added {money(d['amount'], cur)} to Order {d['order_id']}'s cost, counted as paid."
+    elif k == "retag" and d.get("merge_into"):
+        old = store.get_post(d["post_id"])
+        tgt = store.get_post(d["merge_into"])
+        if not old or not tgt:
+            raise ValueError("One of those posts no longer exists.")
+        snap = {"post": dict(old), "target_images": tgt["image_file_ids"],
+                "order_ids": [r["id"] for r in store.all("SELECT id FROM orders WHERE post_id=?", (old["id"],))],
+                "item_ids": [r["id"] for r in store.all("SELECT id FROM items WHERE post_id=?", (old["id"],))]}
+        merged = list(dict.fromkeys(json.loads(tgt["image_file_ids"]) + json.loads(old["image_file_ids"])))
+        store.run("UPDATE posts SET image_file_ids=? WHERE id=?", (json.dumps(merged), tgt["id"]))
+        store.run("UPDATE orders SET post_id=? WHERE post_id=?", (tgt["id"], old["id"]))
+        store.run("UPDATE items SET post_id=? WHERE post_id=?", (tgt["id"], old["id"]))
+        store.run("DELETE FROM posts WHERE id=?", (old["id"],))
+        result = {"type": "retag_merge", "target_id": tgt["id"], "snapshot": snap}
+        text = f"✅ Merged #{d['old']} into #{d['new']}: {len(snap['item_ids'])} item(s) now sit under #{d['new']}."
     elif k == "retag":
         if store.find_post_by_tag(d["new"]):
             raise ValueError(f"#{d['new']} is already used by another post.")
@@ -701,6 +720,19 @@ def undo_last(store: Store) -> str:
         store.run("UPDATE orders SET total_due=total_due-?, topup=topup-? WHERE id=?",
                   (r["amount"], r["amount"], r["order_id"]))
         msg = f"Removed the second payment from order {r['order_id']}."
+    elif r["type"] == "retag_merge":
+        snap = r["snapshot"]
+        post = snap["post"]
+        if store.get_post_by_tag(post["tag"]):
+            msg = f"Couldn't restore #{post['tag']}: another post uses it now."
+        else:
+            store.run(f"INSERT INTO posts({','.join(post)}) VALUES({','.join('?' * len(post))})", list(post.values()))
+            for oid in snap["order_ids"]:
+                store.run("UPDATE orders SET post_id=? WHERE id=?", (post["id"], oid))
+            for iid in snap["item_ids"]:
+                store.run("UPDATE items SET post_id=? WHERE id=?", (post["id"], iid))
+            store.run("UPDATE posts SET image_file_ids=? WHERE id=?", (snap["target_images"], r["target_id"]))
+            msg = f"Un-merged: #{post['tag']} is back with its items."
     elif r["type"] == "retag":
         if store.get_post_by_tag(r["old"]):
             msg = f"Couldn't restore #{r['old']}: another post uses it now."
@@ -932,9 +964,15 @@ def retag_draft(store: Store, old: str, new: str) -> dict | str:
         return "A code uses letters, numbers, _ and - only, e.g. anghp6_8b."
     if new == post["tag"]:
         return f"#{new} is already that post's code."
-    if store.find_post_by_tag(new):
-        return f"#{new} is already used by another post. Pick a different code."
     n = store.one("SELECT COUNT(*) c FROM items WHERE post_id=?", (post["id"],))["c"]
+    target = store.find_post_by_tag(new)
+    if target:
+        if sim(post["title"], target["title"]) < 0.6:
+            return (f"#{new} is already used by a different product ({target['title'][:50]}). "
+                    "Pick another code, or /retag that one first.")
+        # same product forwarded again under the new code: fold the old post into it
+        return {"kind": "retag", "merge_into": target["id"], "post_id": post["id"], "old": post["tag"],
+                "new": target["tag"], "title": post["title"][:70], "n_items": n}
     return {"kind": "retag", "post_id": post["id"], "old": post["tag"], "new": new,
             "title": post["title"][:70], "n_items": n}
 

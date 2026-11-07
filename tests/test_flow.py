@@ -2,6 +2,7 @@
 
 The sample data mirrors the real messages the seller sends.
 """
+import json
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -779,3 +780,34 @@ def test_retag_when_seller_reuses_a_code(env):
     assert not ingest(store, FakeParser(new), cfg, text="#anghp6_8 other again", photo="B2", channel=True)["draft"]["warnings"]
     # /undo of the rename works while the old code is still free (the new post above was never confirmed)
     assert "Code is back to #anghp6_8" in pl.undo_last(store)
+
+
+def test_retag_into_existing_same_product_merges_posts(env):
+    cfg, store = env
+    now = datetime.now(TZ)
+    title = "ateez golden hour pt.6 beatroad fansign & 1:1 video call event"
+    for tag, photo in (("anghp6_8", "A"), ("anghp6_9", "B")):   # the refreshed post was saved under the new code
+        post = {"kind": "channel_post", "summary": "p", "tag": tag, "title": title}
+        confirm(store, ingest(store, FakeParser(post), cfg, text=f"#{tag} {title}", photo=photo, channel=True), cfg)
+    other = {"kind": "channel_post", "summary": "p", "tag": "anghp6_10", "title": "ateez 8th anniversary md admin online purchase"}
+    confirm(store, ingest(store, FakeParser(other), cfg, text="#anghp6_10 x", photo="C", channel=True), cfg)
+    order = {"kind": "order_confirmation", "summary": "o", "title": title, "total_due": 20.0,
+             "items": [{"name": "OT8", "qty": 8, "line_total": 20.0}]}
+    out = ingest(store, FakeParser(order), cfg, text="order", when=now)
+    confirm(store, out, cfg)
+    old_id = store.get_post_by_tag("anghp6_8")["id"]
+    store.run("UPDATE orders SET post_id=?", (old_id,))
+    store.run("UPDATE items SET post_id=?", (old_id,))
+
+    assert "different product" in pl.retag_draft(store, "anghp6_8", "anghp6_10")      # not the same product: refused
+    d = pl.retag_draft(store, "anghp6_8", "anghp6_9")
+    assert d["merge_into"] == store.get_post_by_tag("anghp6_9")["id"]
+    assert "merge #anghp6_8 into it" in pl.render_draft(d, "S$", TZ)
+    assert "Merged #anghp6_8 into #anghp6_9: 1 item(s)" in pl.apply_draft(store, store.draft_add("retag", d), "S$", TZ)
+    new = store.get_post_by_tag("anghp6_9")
+    assert store.get_post_by_tag("anghp6_8") is None
+    assert store.one("SELECT post_id FROM items WHERE id=1")["post_id"] == new["id"]
+    assert sorted(json.loads(new["image_file_ids"])) == ["A", "B"]
+    assert "Un-merged: #anghp6_8 is back" in pl.undo_last(store)
+    assert store.one("SELECT post_id FROM items WHERE id=1")["post_id"] == old_id
+    assert json.loads(store.get_post_by_tag("anghp6_9")["image_file_ids"]) == ["B"]
